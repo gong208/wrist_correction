@@ -1,4 +1,3 @@
-
 """
 hand prior for SMPL-H
 Author: Xianghui, 12 January 2022
