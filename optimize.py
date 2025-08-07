@@ -411,9 +411,9 @@ def optimize1(index, name, visualize=False, fname='', use_fixed_poses=False):
     if T<1:
         return
 
-    SMPLX_PATH='../models/smplx'
+    SMPLX_PATH='models/smplx'
     sbj_m=sbj_m_all[gender]
-    OBJ_PATH='../gt/omomo/objects'
+    OBJ_PATH='data/omomo/objects'
     obj_dir_name=os.path.join(OBJ_PATH,obj_name)
 
     MMESH=trimesh.load(os.path.join(obj_dir_name,obj_name+'.obj'))
@@ -1186,7 +1186,7 @@ if __name__ == '__main__':
         print("Using original poses from .npz files")
         export_file = f"./omomo_optimization_0.22_f/"
 
-    OMOMO_DATA_ROOT=f'../gt/omomo/sequences_canonical' 
+    OMOMO_DATA_ROOT=f'data/omomo/sequences_canonical' 
     
     LISTDIR=np.load('./omomo_listdir.npy', allow_pickle=True)
     # LIST=LISTDIR

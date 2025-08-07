@@ -27,6 +27,12 @@ from scipy.spatial.transform import Rotation as R, Slerp
 from human_body_prior.body_model.body_model import BodyModel
 from bone_lists import bone_list_behave, bone_list_omomo
 
+# Joint indices
+LEFT_WRIST = 20
+RIGHT_WRIST = 21
+LEFT_ELBOW = 18
+RIGHT_ELBOW = 19
+
 MODEL_PATH = 'models'
 
 ######################################## smplh 10 ########################################
@@ -137,9 +143,9 @@ def compute_palm_contact_and_orientation(
     human_joints: torch.Tensor,       # (T, J, 3)
     object_verts: torch.Tensor,       # (T, N, 3)
     hand: str = 'right',              # 'left' 或 'right'
-    contact_thresh: float = 0.05,     # 接触距离阈值（单位 m）
-    orient_angle_thresh: float = 90.0,# 朝向最大夹角阈值（度），90° 即半球面
-    orient_dist_thresh: float = 0.05  # 朝向距离阈值（单位 m），用于筛选接触点
+    contact_thresh: float = 0.09,     # 接触距离阈值（单位 m）
+    orient_angle_thresh: float = 70.0,# 朝向最大夹角阈值（度），90° 即半球面
+    orient_dist_thresh: float = 0.09  # 朝向距离阈值（单位 m），用于筛选接触点
 
 ):
     """
@@ -899,7 +905,7 @@ def detect_and_fix_all_persistent_flips_right(twist_list, poses, joint_idx, axis
         else:
             i += 1
 
-def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=20):
+def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, human_joints=None, object_verts=None, jump_thresh=20):
     """
     Fixes wrist flips:
     - Uses directional fix if twist jumps are detected
@@ -911,15 +917,29 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
 
     out_of_bounds = [(tw > 90 or tw < -110) for tw in twist_list]
     twist_array = np.array(twist_list, dtype=np.float32)
+    
     # Calculate proportion of frames where hand is in contact but not in correct orientation
-    contact_frames = contact_mask.bool().sum().item()
+    # Move tensors to CPU for numpy operations
+    contact_mask_cpu = contact_mask.bool().cpu()
+    orient_mask_cpu = orient_mask.bool().cpu()
+    
+    contact_frames = contact_mask_cpu.sum().item()
     if contact_frames > 0:
-        contact_but_wrong_orient = ((contact_mask.bool()) & (~orient_mask.bool())).sum().item()
+        contact_but_wrong_orient = (contact_mask_cpu & (~orient_mask_cpu)).sum().item()
         proportion_wrong_orient_given_contact = contact_but_wrong_orient / contact_frames
     else:
         proportion_wrong_orient_given_contact = 0.0
     
+    # Calculate proportion of out-of-bounds frames among non-contact frames only
+    non_contact_frames = (~contact_mask_cpu).sum().item()
+    if non_contact_frames > 0:
+        non_contact_out_of_bounds = ((~contact_mask_cpu) & (np.array(out_of_bounds))).sum().item()
+        proportion_out_of_bounds_given_no_contact = non_contact_out_of_bounds / non_contact_frames
+    else:
+        proportion_out_of_bounds_given_no_contact = 0.0
+    
     print(f"left orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
+    print(f"left out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
     if large_jump_indices:
         print(f"left Detected {len(large_jump_indices)} flip jump(s) — using directional persistent fix: {large_jump_indices}.")
         poses = fix_flips_left(
@@ -932,24 +952,46 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
         )        # Detect and fix all persistent flips
         # detect_and_fix_all_persistent_flips_left(twist_list, poses, joint_idx, axis, threshold=jump_thresh)
 
-    elif np.mean(out_of_bounds) > 0.7 or proportion_wrong_orient_given_contact > 0.7:
-        print(f"left Persistent flip (>{int(0.7 * 100)}%) — applying global 180° correction to joint {joint_idx}")
+    elif proportion_wrong_orient_given_contact > 0.7:
+        # If there is contact but wrong orientation proportion is large, calculate specific angle
+        print(f"left Contact with wrong orientation detected - calculating specific angles")
+        
+        if human_joints is not None and object_verts is not None:
+            # Calculate specific angles using the palm-object angle function
+            specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='left', contact_thresh=0.09)
+            
+            for t in range(T):
+                if contact_mask_cpu[t] and not orient_mask_cpu[t]:
+                    # Use the calculated specific angle
+                    angle = specific_angles[t]
+                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, angle
+                    )
+        else:
+            # Fallback to 180 degrees if data not available
+            for t in range(T):
+                poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                    poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+                )
+    elif proportion_out_of_bounds_given_no_contact > 0.7:
+        # If no contact but out of bounds proportion is large, rotate by 180 degrees
+        print(f"left No contact but out of bounds - applying 180° rotation")
         for t in range(T):
             poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
                 poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
             )
 
-    else:
-        print(f"left No persistent flip — applying transient interpolation for joint {joint_idx}")
-        # Build transient flags
-        twist_diff = [abs(twist_list[i+1] - twist_list[i]) for i in range(T - 1)]
-        sudden_flags = [False] + [d > jump_thresh for d in twist_diff]
-        flip_flags = [tw > 90 or tw < -110 for tw in twist_list]
-        combined_flags = [a or b for a, b in zip(flip_flags, sudden_flags)]
-        fix_transient_flips(poses, combined_flags, joint_idx)
+    # else:
+    #     print(f"left No persistent flip — applying transient interpolation for joint {joint_idx}")
+    #     # Build transient flags
+    #     twist_diff = [abs(twist_list[i+1] - twist_list[i]) for i in range(T - 1)]
+    #     sudden_flags = [False] + [d > jump_thresh for d in twist_diff]
+    #     flip_flags = [tw > 90 or tw < -110 for tw in twist_list]
+    #     combined_flags = [a or b for a, b in zip(flip_flags, sudden_flags)]
+    #     fix_transient_flips(poses, combined_flags, joint_idx)
     return poses
 
-def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=20):
+def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, human_joints=None, object_verts=None, jump_thresh=20):
     """
     Fixes wrist flips:
     - Uses directional fix if twist jumps are detected
@@ -961,15 +1003,29 @@ def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, jo
 
     out_of_bounds = [(tw < -90 or tw > 110) for tw in twist_list]
     twist_array = np.array(twist_list, dtype=np.float32)
+    
     # Calculate proportion of frames where hand is in contact but not in correct orientation
-    contact_frames = contact_mask.bool().sum().item()
+    # Move tensors to CPU for numpy operations
+    contact_mask_cpu = contact_mask.bool().cpu()
+    orient_mask_cpu = orient_mask.bool().cpu()
+    
+    contact_frames = contact_mask_cpu.sum().item()
     if contact_frames > 0:
-        contact_but_wrong_orient = ((contact_mask.bool()) & (~orient_mask.bool())).sum().item()
+        contact_but_wrong_orient = (contact_mask_cpu & (~orient_mask_cpu)).sum().item()
         proportion_wrong_orient_given_contact = contact_but_wrong_orient / contact_frames
     else:
         proportion_wrong_orient_given_contact = 0.0
     
+    # Calculate proportion of out-of-bounds frames among non-contact frames only
+    non_contact_frames = (~contact_mask_cpu).sum().item()
+    if non_contact_frames > 0:
+        non_contact_out_of_bounds = ((~contact_mask_cpu) & (np.array(out_of_bounds))).sum().item()
+        proportion_out_of_bounds_given_no_contact = non_contact_out_of_bounds / non_contact_frames
+    else:
+        proportion_out_of_bounds_given_no_contact = 0.0
+    
     print(f"right orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
+    print(f"right out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
     
     if large_jump_indices:
         print(f"right Detected {len(large_jump_indices)} flip jump(s) — using directional persistent fix: {large_jump_indices}.")
@@ -983,22 +1039,134 @@ def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, jo
         )        # Detect and fix all persistent flips
     # if orient mask is false when contact mask is true at the same frame for 0.7 of the frames, apply global correction as well
     
-    elif proportion_wrong_orient_given_contact > 0.7 or np.mean(out_of_bounds) > 0.7:
-        print(f"right Persistent flip (>{int(0.7 * 100)}%) — applying global 180° correction to joint {joint_idx}")
-        for t in range(T):
-            poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
-            )
+    elif proportion_wrong_orient_given_contact > 0.7 or proportion_out_of_bounds_given_no_contact > 0.7:
+        print(f"right Persistent flip (>{int(0.7 * 100)}%) — applying specific angle correction to joint {joint_idx}")
+        
+        # Calculate specific angles based on contact and orientation conditions
+        if proportion_wrong_orient_given_contact > 0.7:
+            # If there is contact but wrong orientation proportion is large, calculate specific angle
+            print(f"right Contact with wrong orientation detected - calculating specific angles")
+            
+            if human_joints is not None and object_verts is not None:
+                # Calculate specific angles using the palm-object angle function
+                specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='right', contact_thresh=0.09)
+                
+                for t in range(T):
+                    if contact_mask_cpu[t] and not orient_mask_cpu[t]:
+                        # Use the calculated specific angle
+                        angle = specific_angles[t]
+                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, angle
+                        )
+                    else:
+                        # Apply 180 degree rotation for other cases
+                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+                        )
+            else:
+                # Fallback to 180 degrees if data not available
+                for t in range(T):
+                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+                    )
+        else:
+            # If no contact but out of bounds proportion is large, rotate by 180 degrees
+            print(f"right No contact but out of bounds - applying 180° rotation")
+            for t in range(T):
+                poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
+                    poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+                )
 
-    else:
-        print(f"right No persistent flip — applying transient interpolation for joint {joint_idx}")
-        # Build transient flags
-        twist_diff = [abs(twist_list[i+1] - twist_list[i]) for i in range(T - 1)]
-        sudden_flags = [False] + [d > jump_thresh for d in twist_diff]
-        flip_flags = [tw < -90 or tw > 110 for tw in twist_list]
-        combined_flags = [a or b for a, b in zip(flip_flags, sudden_flags)]
-        fix_transient_flips(poses, combined_flags, joint_idx)
+    # else:
+        # print(f"right No persistent flip — applying transient interpolation for joint {joint_idx}")
+        # # Build transient flags
+        # twist_diff = [abs(twist_list[i+1] - twist_list[i]) for i in range(T - 1)]
+        # sudden_flags = [False] + [d > jump_thresh for d in twist_diff]
+        # flip_flags = [tw < -90 or tw > 110 for tw in twist_list]
+        # combined_flags = [a or b for a, b in zip(flip_flags, sudden_flags)]
+        # fix_transient_flips(poses, combined_flags, joint_idx)
     return poses
+
+def compute_palm_object_angle(
+    human_joints: torch.Tensor,       # (T, J, 3)
+    object_verts: torch.Tensor,       # (T, N, 3)
+    hand: str = 'left',               # 'left' or 'right'
+    contact_thresh: float = 0.07      # contact distance threshold
+):
+    """
+    Compute the angle between palm normal and vector from palm center to nearest object vertices.
+    Returns the angle in degrees for each frame.
+    """
+    # 0) 预处理：同设备
+    if human_joints.device != object_verts.device:
+        human_joints = human_joints.to(object_verts.device)
+    T, J, _ = human_joints.shape
+
+    # 1) 选关节索引 & 法线翻转
+    hand = hand.lower()
+    if hand.startswith('r'):
+        # 右手索引
+        IDX_WRIST     = 21
+        IDX_INDEX     = 40
+        IDX_PINKY     = 46
+        flip_normal   = False
+    else:
+        # 左手索引
+        IDX_WRIST     = 20
+        IDX_INDEX     = 25
+        IDX_PINKY     = 31
+        flip_normal   = True
+
+    # 2) 提取关节位置
+    wrist = human_joints[:, IDX_WRIST    , :]  # (T,3)
+    idx   = human_joints[:, IDX_INDEX    , :]  # (T,3)
+    pinky = human_joints[:, IDX_PINKY    , :]  # (T,3)
+
+    # 3) 计算法线 & 归一化
+    v1 = idx   - wrist   # (T,3)
+    v2 = pinky - wrist   # (T,3)
+    normals = torch.cross(v1, v2, dim=1)  # (T,3)
+    if flip_normal:
+        normals = -normals
+    normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
+
+    # 4) 计算手掌质心
+    centroid = (wrist + idx + pinky) / 3.0  # (T,3)
+
+    # 5) 计算所有顶点相对向量 & 距离
+    rel = object_verts - centroid.unsqueeze(1)   # (T, N, 3)
+    dists = rel.norm(dim=2)                     # (T, N)
+
+    # 6) 找到最近的接触点
+    contact_mask = (dists < contact_thresh)  # (T, N)
+    
+    angles = torch.zeros(T, device=human_joints.device)
+    
+    for t in range(T):
+        if contact_mask[t].any():
+            # 找到最近的接触点
+            contact_dists = dists[t][contact_mask[t]]
+            contact_rel = rel[t][contact_mask[t]]
+            
+            # 找到最近的接触点
+            min_idx = torch.argmin(contact_dists)
+            nearest_rel = contact_rel[min_idx]
+            
+            # 归一化相对向量
+            nearest_rel_norm = nearest_rel / (nearest_rel.norm() + 1e-8)
+            
+            # 计算余弦值
+            cosine = torch.dot(normals[t], nearest_rel_norm)
+            cosine = torch.clamp(cosine, -1.0, 1.0)  # 确保在有效范围内
+            
+            # 计算角度
+            angle_rad = torch.acos(cosine)
+            angles[t] = torch.rad2deg(angle_rad)
+        else:
+            # 如果没有接触点，使用默认角度
+            angles[t] = 180.0
+    
+    return angles.cpu().numpy()
 
 def main(dataset_path, sequence_name):
     # Derived paths
@@ -1033,7 +1201,7 @@ def main(dataset_path, sequence_name):
     print("object name:", obj_name)
     ov = np.array(OBJ_MESH.vertices).astype(np.float32)
     object_faces = OBJ_MESH.faces.astype(np.int32)
-    devcie = torch.device('cuda:0')
+    device = torch.device('cuda:0')
     ov = torch.from_numpy(ov).float().to(device)
     rot = torch.tensor(angle_matrix).float().to(device)
     obj_trans = torch.tensor(obj_trans).float().to(device) # t
@@ -1058,23 +1226,22 @@ def main(dataset_path, sequence_name):
         twist_right_list.append(twist_right)
 
     contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='left',
-        contact_thresh=0.09, orient_angle_thresh=90.0
+        joints, object_verts, hand='left'
     )
-
+    for i in range(T):
+        print(f"Frame {i} contact_mask_l: {contact_mask_l[i]} orient_mask_l: {orient_mask_l[i]}")
     contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='right',
-        contact_thresh=0.09, orient_angle_thresh=90.0
+        joints, object_verts, hand='right'
     )
     # LEFT
     axis_left = canonical_joints[LEFT_WRIST] - canonical_joints[LEFT_ELBOW]
     axis_left /= np.linalg.norm(axis_left)
-    poses = robust_wrist_flip_fix_left(twist_left_list, contact_mask_l, orient_mask_l, poses, LEFT_WRIST, axis_left)
+    poses = robust_wrist_flip_fix_left(twist_left_list, contact_mask_l, orient_mask_l, poses, LEFT_WRIST, axis_left, joints, object_verts)
 
     # RIGHT
     axis_right = canonical_joints[RIGHT_WRIST] - canonical_joints[RIGHT_ELBOW]
     axis_right /= np.linalg.norm(axis_right)
-    poses = robust_wrist_flip_fix_right(twist_right_list, contact_mask_r, orient_mask_r, poses, RIGHT_WRIST, axis_right)
+    poses = robust_wrist_flip_fix_right(twist_right_list, contact_mask_r, orient_mask_r, poses, RIGHT_WRIST, axis_right, joints, object_verts)
 
 
     if dataset_path.upper() == 'GRAB':
@@ -1092,31 +1259,31 @@ def main(dataset_path, sequence_name):
 
     twist_left_prev = 0
     twist_right_prev = 0
-    for frame_idx in range(T):
-        joints_np = joints[frame_idx].cpu().numpy()  # (55, 3)
-        pose_i = poses[frame_idx].reshape(52, 3)  # axis-angle per joint
+    # for frame_idx in range(T):
+    #     joints_np = joints[frame_idx].cpu().numpy()  # (55, 3)
+    #     pose_i = poses[frame_idx].reshape(52, 3)  # axis-angle per joint
 
-        twist_left, twist_right = detect_hand_twist_from_canonical(pose_i, canonical_joints)
-        if frame_idx == 0:
-            twist_left_prev = twist_left
-            twist_right_prev = twist_right
-        print(f"Frame {frame_idx}: Left wrist twist angle: {twist_left:.1f} deg")
-        print(f"Frame {frame_idx}: Right wrist twist angle: {twist_right:.1f} deg")
+    #     twist_left, twist_right = detect_hand_twist_from_canonical(pose_i, canonical_joints)
+    #     if frame_idx == 0:
+    #         twist_left_prev = twist_left
+    #         twist_right_prev = twist_right
+    #     print(f"Frame {frame_idx}: Left wrist twist angle: {twist_left:.1f} deg")
+    #     print(f"Frame {frame_idx}: Right wrist twist angle: {twist_right:.1f} deg")
 
-        if twist_left > 90 or twist_left < -110 :
-            print("⚠️ Left hand might be flipped!")
+    #     if twist_left > 90 or twist_left < -110 :
+    #         print("⚠️ Left hand might be flipped!")
 
-        if twist_right > 110 or twist_right < -90 :
-            print("⚠️ Right hand might be flipped!")
+    #     if twist_right > 110 or twist_right < -90 :
+    #         print("⚠️ Right hand might be flipped!")
 
 
-        if abs(twist_left - twist_left_prev) > 40 :
-            print("⚠️ Left hand might be flipped between frames!")
+    #     if abs(twist_left - twist_left_prev) > 40 :
+    #         print("⚠️ Left hand might be flipped between frames!")
 
-        if abs(twist_right - twist_right_prev) > 40:
-            print("⚠️ Right hand might be flipped between frames!")
-        twist_left_prev = twist_left
-        twist_right_prev = twist_right
+    #     if abs(twist_right - twist_right_prev) > 40:
+    #         print("⚠️ Right hand might be flipped between frames!")
+    #     twist_left_prev = twist_left
+    #     twist_right_prev = twist_right
 
     
 

@@ -291,9 +291,9 @@ def compute_palm_contact_and_orientation(
     human_joints: torch.Tensor,       # (T, J, 3)
     object_verts: torch.Tensor,       # (T, N, 3)
     hand: str = 'right',              # 'left' 或 'right'
-    contact_thresh: float = 0.05,     # 接触距离阈值（单位 m）
-    orient_angle_thresh: float = 90.0,# 朝向最大夹角阈值（度），90° 即半球面
-    orient_dist_thresh: float = 0.05  # 朝向距离阈值（单位 m），用于筛选接触点
+    contact_thresh: float = 0.09,     # 接触距离阈值（单位 m）
+    orient_angle_thresh: float = 75.0,# 朝向最大夹角阈值（度），90° 即半球面
+    orient_dist_thresh: float = 0.09  # 朝向距离阈值（单位 m），用于筛选接触点
 
 ):
     """
@@ -803,13 +803,11 @@ def fix_all_joint_poses(poses, joints, object_verts, canonical_joints, threshold
     # First, get orientation masks for both hands
     print("Computing palm contact and orientation masks...")
     contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='left',
-        contact_thresh=0.09, orient_angle_thresh=90.0
+        joints, object_verts, hand='left'
     )
     
     contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='right',
-        contact_thresh=0.09, orient_angle_thresh=90.0
+        joints, object_verts, hand='right'
     )
     
     print(f"Left hand: {contact_mask_l.sum().item()}/{len(contact_mask_l)} contact frames, {orient_mask_l.sum().item()}/{len(orient_mask_l)} correct orientation")
