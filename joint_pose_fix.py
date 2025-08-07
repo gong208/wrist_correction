@@ -496,7 +496,7 @@ def detect_flips(poses, joint_idx, threshold=20):
     
     return flip_indices, angle_diffs, relative_axes
 
-def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, relative_axes, canonical_joints, threshold=20):
+def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, relative_axes, canonical_joints, threshold=20, left_twist_bound_mask=None, right_twist_bound_mask=None):
     """
     Fix joint poses based on flip detection and orientation mask.
     Process flips sequentially and check if segments have already been fixed.
@@ -510,6 +510,8 @@ def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, re
         relative_axes: list of relative rotation axes between consecutive frames
         canonical_joints: (J, 3) canonical joint positions in rest pose
         threshold: angle threshold in degrees
+        left_twist_bound_mask: list of bool indicating left wrist out-of-bounds frames (optional)
+        right_twist_bound_mask: list of bool indicating right wrist out-of-bounds frames (optional)
     
     Returns:
         np.array: fixed poses
@@ -584,17 +586,65 @@ def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, re
         
         print(f"    Orientation ratios: left={left_orient_ratio:.3f}, right={right_orient_ratio:.3f}")
         
-        # Determine which segment to fix (the one with lower orientation ratio)
-        if left_orient_ratio < right_orient_ratio:
-            # Fix left segment
-            seg_start, seg_end = left_start, left_end
-            jump_angle = angle_diffs[flip_idx]
-            print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
+        # Check if both segments have 0 orientation frames
+        left_no_orient = left_orient_ratio == 0.0
+        right_no_orient = right_orient_ratio == 0.0
+        
+        if left_no_orient and right_no_orient:
+            print(f"    Both segments have 0 orientation frames - using twist angle bound analysis")
+            # Use twist angle bound masks to determine which segment to fix
+            # Use only the relevant bound mask for this joint
+            if joint_idx in [LEFT_COLLAR, LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST] and left_twist_bound_mask is not None:
+                # For left wrist, use left bound mask for both segments
+                left_oob_count = sum(left_twist_bound_mask[left_start:left_end+1]) if left_end >= left_start else 0
+                right_oob_count = sum(left_twist_bound_mask[right_start:right_end+1]) if right_end >= right_start else 0
+            elif joint_idx in [RIGHT_COLLAR, RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST] and right_twist_bound_mask is not None:
+                # For right wrist, use right bound mask for both segments
+                left_oob_count = sum(right_twist_bound_mask[left_start:left_end+1]) if left_end >= left_start else 0
+                right_oob_count = sum(right_twist_bound_mask[right_start:right_end+1]) if right_end >= right_start else 0
+            else:
+                # Fallback when bound masks not available
+                left_oob_count = 0
+                right_oob_count = 0
+            
+            print(f"    Left segment out-of-bounds: {left_oob_count}/{left_end-left_start+1}")
+            print(f"    Right segment out-of-bounds: {right_oob_count}/{right_end-right_start+1}")
+            
+            # Fix the segment with more out-of-bounds frames
+            if left_oob_count > right_oob_count:
+                seg_start, seg_end = left_start, left_end
+                jump_angle = angle_diffs[flip_idx]
+                print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (more out-of-bounds)")
+            elif right_oob_count > left_oob_count:
+                seg_start, seg_end = right_start, right_end
+                jump_angle = -angle_diffs[flip_idx]
+                print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (more out-of-bounds)")
+            elif left_oob_count == right_oob_count and left_oob_count > 0:
+                # Equal out-of-bounds, use segment length as tiebreaker
+                left_length = left_end - left_start + 1
+                right_length = right_end - right_start + 1
+                
+                if left_length > right_length:
+                    seg_start, seg_end = left_start, left_end
+                    jump_angle = angle_diffs[flip_idx]
+                    print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (longer segment)")
+                else:
+                    seg_start, seg_end = right_start, right_end
+                    jump_angle = -angle_diffs[flip_idx]
+                    print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (longer segment)")
+
         else:
-            # Fix right segment
-            seg_start, seg_end = right_start, right_end
-            jump_angle = -angle_diffs[flip_idx]
-            print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
+            # Determine which segment to fix (the one with lower orientation ratio)
+            if left_orient_ratio < right_orient_ratio:
+                # Fix left segment
+                seg_start, seg_end = left_start, left_end
+                jump_angle = angle_diffs[flip_idx]
+                print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
+            else:
+                # Fix right segment
+                seg_start, seg_end = right_start, right_end
+                jump_angle = -angle_diffs[flip_idx]
+                print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
         
         # Check if the segment to be fixed is already mostly fixed
         fixed_ratio = fixed[np.arange(seg_start, seg_end + 1)].mean()
@@ -652,9 +702,84 @@ def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, re
     
     return fixed_poses
 
+
+
+
+def detect_hand_twist_from_canonical_batch(poses, joints_canonical):
+    """
+    Detect wrist twist angles for all poses in parallel using canonical bone axis (rest pose).
+
+    Args:
+        poses: (T, 156) array of axis-angle poses for all frames
+        joints_canonical: (55, 3) array of joint positions in rest pose
+
+    Returns:
+        twist_left_list, twist_right_list: lists of twist angles (in degrees) for each wrist
+    """
+    # Joint indices
+    LEFT_ELBOW, LEFT_WRIST = 18, 20
+    RIGHT_ELBOW, RIGHT_WRIST = 19, 21
+
+    # Canonical bone axes from rest pose
+    bone_axis_left = joints_canonical[LEFT_WRIST] - joints_canonical[LEFT_ELBOW]
+    bone_axis_left /= np.linalg.norm(bone_axis_left)
+
+    bone_axis_right = joints_canonical[RIGHT_WRIST] - joints_canonical[RIGHT_ELBOW]
+    bone_axis_right /= np.linalg.norm(bone_axis_right)
+
+    # Extract wrist poses for all frames
+    T = poses.shape[0]
+    left_wrist_poses = poses[:, LEFT_WRIST*3:(LEFT_WRIST+1)*3]  # (T, 3)
+    right_wrist_poses = poses[:, RIGHT_WRIST*3:(RIGHT_WRIST+1)*3]  # (T, 3)
+
+    # Fully vectorized computation of twist angles
+    twist_left_list = compute_twist_angles_vectorized(left_wrist_poses, bone_axis_left)
+    twist_right_list = compute_twist_angles_vectorized(right_wrist_poses, bone_axis_right)
+    
+    return twist_left_list, twist_right_list
+
+
+def compute_twist_angles_vectorized(wrist_poses, bone_axis):
+    """
+    Compute twist angles for all frames in parallel.
+    
+    Args:
+        wrist_poses: (T, 3) array of wrist poses for all frames
+        bone_axis: (3,) array of bone axis (unit vector)
+    
+    Returns:
+        twist_angles: (T,) array of twist angles in degrees
+    """
+    # Compute angles for all frames at once
+    angles = np.linalg.norm(wrist_poses, axis=1)  # (T,)
+    
+    # Handle zero angles
+    zero_mask = angles < 1e-6
+    angles[zero_mask] = 1.0  # Avoid division by zero
+    
+    # Compute normalized axes for all frames
+    axes = wrist_poses / angles[:, np.newaxis]  # (T, 3)
+    
+    # Compute twist cosines for all frames
+    twist_cos = np.dot(axes, bone_axis)  # (T,)
+    
+    # Compute twist angles
+    twist_angles = angles * twist_cos  # (T,)
+    
+    # Convert to degrees
+    twist_angles_deg = np.rad2deg(twist_angles)
+    
+    # Set zero angles back to zero
+    twist_angles_deg[zero_mask] = 0.0
+    
+    return twist_angles_deg.tolist()
+
+
+
 def fix_all_joint_poses(poses, joints, object_verts, canonical_joints, threshold=20):
     """
     Fix poses for all specified joints (collar, shoulder, elbow, wrist).
+    Iteratively fix all joints together until the total number of flips stops decreasing or becomes zero.
     
     Args:
         poses: (T, 156) pose parameters
@@ -688,31 +813,83 @@ def fix_all_joint_poses(poses, joints, object_verts, canonical_joints, threshold
     )
     
     print(f"Left hand: {contact_mask_l.sum().item()}/{len(contact_mask_l)} contact frames, {orient_mask_l.sum().item()}/{len(orient_mask_l)} correct orientation")
-    print(f"Right hand: {contact_mask_r.sum().item()}/{len(contact_mask_r)} contact frames, {orient_mask_r.sum().item()}/{len(orient_mask_r)} correct orientation")
+    print(f"Right hand: {contact_mask_r.sum().item()}/{len(contact_mask_r)} contact frames, {orient_mask_r.sum().item()}/{len(contact_mask_r)} correct orientation")
     
-    # Process each joint
-    for joint_idx in joints_to_fix:
-        print(f"\nProcessing joint {joint_idx}...")
+    # Compute wrist twist angles and create bound masks
+    print("Computing wrist twist angles and bound masks...")
+    twist_left_list, twist_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
+    
+    # Create twist angle bound masks
+    T = len(twist_left_list)
+    left_twist_bound_mask = [(tw > 90 or tw < -110) for tw in twist_left_list]
+    right_twist_bound_mask = [(tw > 110 or tw < -90) for tw in twist_right_list]
+    
+    print(f"Left twist out-of-bounds frames: {sum(left_twist_bound_mask)}/{T}")
+    print(f"Right twist out-of-bounds frames: {sum(right_twist_bound_mask)}/{T}")
+    
+    # Iteratively fix all joints together
+    iteration = 0
+    prev_total_flips = float('inf')
+    
+    while True:
+        iteration += 1
+        print(f"\nIteration {iteration} - Processing all joints together...")
         
-        # Determine which orientation mask to use based on the joint
-        if joint_idx in [LEFT_COLLAR, LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST]:
-            orient_mask = orient_mask_l
-        else:  # RIGHT_COLLAR, RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST
-            orient_mask = orient_mask_r
+        # Track total flips across all joints
+        total_flips = 0
+        joint_flip_counts = {}
         
-        # Detect flips
-        flip_indices, angle_diffs, relative_axes = detect_flips(fixed_poses, joint_idx, threshold)
-        
-        if flip_indices:
-            print(f"  Detected {len(flip_indices)} flips at frames: {flip_indices}")
+        # Process each joint in this iteration
+        for joint_idx in joints_to_fix:
+            # Determine which orientation mask to use based on the joint
+            if joint_idx in [LEFT_COLLAR, LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST]:
+                orient_mask = orient_mask_l
+            else:  # RIGHT_COLLAR, RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST
+                orient_mask = orient_mask_r
             
-            # Fix the poses for this joint
-            fixed_poses = fix_joint_poses(
-                fixed_poses, flip_indices, orient_mask, 
-                joint_idx, angle_diffs, relative_axes, canonical_joints, threshold
-            )
+            # Detect flips for this joint
+            flip_indices, angle_diffs, relative_axes = detect_flips(fixed_poses, joint_idx, threshold)
+            current_flip_count = len(flip_indices)
+            joint_flip_counts[joint_idx] = current_flip_count
+            total_flips += current_flip_count
+            
+            if current_flip_count > 0:
+                print(f"  Joint {joint_idx}: {current_flip_count} flips at frames: {flip_indices}")
+                
+                # Fix the poses for this joint
+                fixed_poses = fix_joint_poses(
+                    fixed_poses, flip_indices, orient_mask, 
+                    joint_idx, angle_diffs, relative_axes, canonical_joints, threshold,
+                    left_twist_bound_mask, right_twist_bound_mask
+                )
+            else:
+                print(f"  Joint {joint_idx}: No flips detected")
+        
+        print(f"  Total flips across all joints: {total_flips}")
+        
+        # Check if we should stop iterating
+        if total_flips == 0:
+            print(f"  No flips remaining across all joints - stopping iterations")
+            break
+        elif total_flips >= prev_total_flips:
+            print(f"  Total flip count did not decrease ({prev_total_flips} -> {total_flips}) - stopping iterations")
+            break
         else:
-            print(f"  No flips detected for joint {joint_idx}")
+            print(f"  Total flip count decreased from {prev_total_flips} to {total_flips} - continuing iterations")
+        
+        # Update for next iteration
+        prev_total_flips = total_flips
+        
+        # Safety check to prevent infinite loops
+        if iteration > 5:
+            print(f"  Reached maximum iterations (20) - stopping")
+            break
+    
+    print(f"\nCompleted {iteration} iterations across all joints")
+    print("Final flip counts per joint:")
+    for joint_idx in joints_to_fix:
+        flip_indices, _, _ = detect_flips(fixed_poses, joint_idx, threshold)
+        print(f"  Joint {joint_idx}: {len(flip_indices)} flips")
     
     return fixed_poses
 

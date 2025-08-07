@@ -610,14 +610,24 @@ def fix_flips_left(
 
         
 
-        # 2.2) 若相等则用 twist 越界点数判断
+        # 2.2) 若相等则用 twist 越界点数判断，如果还是相等则用 segment length
         if math.isclose(left_bad_ratio, right_bad_ratio, rel_tol=1e-6):
             print(f"⚠️ Flip {t} 的左右段 orientation 比例相同：{left_bad_ratio:.2f} vs {right_bad_ratio:.2f}")
+            # Use twist out-of-bounds as first tiebreaker
             left_oob  = ((twist_angles[left_start:left_end] >  90) |
                          (twist_angles[left_start:left_end] < -110)).sum()
             right_oob = ((twist_angles[right_start:right_end] >  90) |
                          (twist_angles[right_start:right_end] < -110)).sum()
-            left_bad = left_oob  > right_oob
+            print(f"    Twist OOB tiebreaker: left={left_oob}, right={right_oob}")
+            
+            if left_oob > right_oob:
+                left_bad = True
+            elif right_oob > left_oob:
+                left_bad = False
+            else:
+                # If OOB counts are also equal, use segment length as final tiebreaker
+                left_bad = left_len > right_len
+                print(f"    OOB counts equal, using segment length as final tiebreaker: left={left_len}, right={right_len}")
         else:
             left_bad = left_bad_ratio > right_bad_ratio
 
@@ -721,14 +731,24 @@ def fix_flips_right(
         left_bad_ratio  = 1.0 - float(orient_mask[left_start:left_end].float().mean().cpu().item())
         right_bad_ratio = 1.0 - float(orient_mask[right_start:right_end].float().mean().cpu().item())
 
-        # 2.2) 若相等则用 twist 越界点数判断
+        # 2.2) 若相等则用 twist 越界点数判断，如果还是相等则用 segment length
         if math.isclose(left_bad_ratio, right_bad_ratio, rel_tol=1e-6):
             print(f"⚠️ Flip {t} 的左右段 orientation 比例相同：{left_bad_ratio:.2f} vs {right_bad_ratio:.2f}")
+            # Use twist out-of-bounds as first tiebreaker
             left_oob  = ((twist_angles[left_start:left_end] > 110) |
                          (twist_angles[left_start:left_end] < -90)).sum()
             right_oob = ((twist_angles[right_start:right_end] > 110) |
                          (twist_angles[right_start:right_end] < -90)).sum()
-            left_bad = left_oob  > right_oob
+            print(f"    Twist OOB tiebreaker: left={left_oob}, right={right_oob}")
+            
+            if left_oob > right_oob:
+                left_bad = True
+            elif right_oob > left_oob:
+                left_bad = False
+            else:
+                # If OOB counts are also equal, use segment length as final tiebreaker
+                left_bad = left_len < right_len
+                print(f"    OOB counts equal, using segment length as final tiebreaker: left={left_len}, right={right_len}")
         else:
             left_bad = left_bad_ratio > right_bad_ratio
 
@@ -879,7 +899,7 @@ def detect_and_fix_all_persistent_flips_right(twist_list, poses, joint_idx, axis
         else:
             i += 1
 
-def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=40):
+def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=20):
     """
     Fixes wrist flips:
     - Uses directional fix if twist jumps are detected
@@ -929,7 +949,7 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
         fix_transient_flips(poses, combined_flags, joint_idx)
     return poses
 
-def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=40):
+def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, jump_thresh=20):
     """
     Fixes wrist flips:
     - Uses directional fix if twist jumps are detected

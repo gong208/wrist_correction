@@ -306,8 +306,8 @@ def main():
         object_verts.detach().cpu().numpy(),
         object_faces,
         save_path=output_path,
-        highlight_frame=args.highlight_frame,
-        highlight_vertex=args.highlight_vertex
+        multi_angle=args.multi_angle,
+        show_frame=True
     )
     
     print(f"Visualization complete: {output_path}")
