@@ -225,9 +225,9 @@ def visualize_smpl(name, MOTION_PATH, model_type, num_betas, use_pca=False):
     OMOMO for SMPLX 16
     vertices: (N, 10475, 3)
     """
-    with np.load(os.path.join(MOTION_PATH, name, 'joint_fixed.npz'), allow_pickle=True) as f:
+    with np.load(os.path.join(MOTION_PATH, name, 'human.npz'), allow_pickle=True) as f:
         poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
-    print(f"motion loaded: {os.path.join(MOTION_PATH, name, 'joint_fixed.npz')}")
+    print(f"motion loaded: {os.path.join(MOTION_PATH, name, 'human.npz')}")
     frame_times = poses.shape[0]
     if num_betas == 10:
         if model_type == 'smplh':
@@ -566,7 +566,8 @@ def fix_flips_left(
     flip_indices: np.ndarray,         # 所有 |twist[t+1]−twist[t]|>threshold 的 t 索引
     joint_idx: int,                   # 要修正的手腕 joint 在 poses 中的索引
     poses: np.ndarray,                # (T, D) 每帧的 axis‐angle pose 向量打平后的数组
-    axis: np.ndarray                  # (3,) 骨骼轴（例如肘到腕的单位向量）
+    axis: np.ndarray,                  # (3,) 骨骼轴（例如肘到腕的单位向量）
+    specific_angles: np.ndarray         # (T,) 每帧的手掌与物体的角度
 ):
     """
     根据突然的大跳变（flip_indices）和 orientation mask
@@ -613,8 +614,8 @@ def fix_flips_left(
 
         left_bad_ratio  = 1.0 - float(orient_mask[left_start:left_end].float().mean().cpu().item())
         right_bad_ratio = 1.0 - float(orient_mask[right_start:right_end].float().mean().cpu().item())
-
         
+        print(f"left_bad_ratio: {left_bad_ratio}, right_bad_ratio: {right_bad_ratio}")
 
         # 2.2) 若相等则用 twist 越界点数判断，如果还是相等则用 segment length
         if math.isclose(left_bad_ratio, right_bad_ratio, rel_tol=1e-6):
@@ -632,7 +633,7 @@ def fix_flips_left(
                 left_bad = False
             else:
                 # If OOB counts are also equal, use segment length as final tiebreaker
-                left_bad = left_len > right_len
+                left_bad = left_len < right_len
                 print(f"    OOB counts equal, using segment length as final tiebreaker: left={left_len}, right={right_len}")
         else:
             left_bad = left_bad_ratio > right_bad_ratio
@@ -648,7 +649,7 @@ def fix_flips_left(
             ref_right_idx = right_end if right_end < T else right_end - 1
 
         # 找两侧的参考角度
-        if 0 < ref_left_idx < T - 1 and 0 < ref_right_idx < T - 1:
+        if 0 <= ref_left_idx <= T - 1 and 0 <= ref_right_idx <= T - 1 and ref_left_idx - ref_right_idx <= 10:
             left_val = twist_angles[ref_left_idx]
             right_val = twist_angles[ref_right_idx]
             interp_vals = np.linspace(left_val, right_val, len(seg))
@@ -666,7 +667,8 @@ def fix_flips_left(
                 fixed[i] = True
         else:
             print(f"⚠️ 无法进行平滑插值，fallback 到常规 jump 修复")
-            angle = (twist_angles[t+1] - twist_angles[t]) if left_bad else -(twist_angles[t+1] - twist_angles[t])
+            # angle = (twist_angles[t+1] - twist_angles[t]) if left_bad else -(twist_angles[t+1] - twist_angles[t])
+            angle = specific_angles[t]
             if left_bad:
                 print(f"🛠 Fixing LEFT segment [{left_start},{left_end}) by {angle:.1f}° at flip {t}")
             else:
@@ -689,7 +691,8 @@ def fix_flips_right(
     flip_indices: np.ndarray,         # 所有 |twist[t+1]−twist[t]|>threshold 的 t 索引
     joint_idx: int,                   # 要修正的手腕 joint 在 poses 中的索引
     poses: np.ndarray,                # (T, D) 每帧的 axis‐angle pose 向量打平后的数组
-    axis: np.ndarray                  # (3,) 骨骼轴（例如肘到腕的单位向量）
+    axis: np.ndarray,                  # (3,) 骨骼轴（例如肘到腕的单位向量）
+    specific_angles: np.ndarray         # (T,) 每帧的手掌与物体的角度
 ):
     """
     根据突然的大跳变（flip_indices）和 orientation mask
@@ -787,7 +790,8 @@ def fix_flips_right(
                 fixed[i] = True
         else:
             print(f"⚠️ 无法进行平滑插值，fallback 到常规 jump 修复")
-            angle = (twist_angles[t+1] - twist_angles[t]) if left_bad else -(twist_angles[t+1] - twist_angles[t])
+            # angle = (twist_angles[t+1] - twist_angles[t]) if left_bad else -(twist_angles[t+1] - twist_angles[t])
+            angle = specific_angles[t]
             if left_bad:
                 print(f"🛠 Fixing LEFT segment [{left_start},{left_end}) by {angle:.1f}° at flip {t}")
             else:
@@ -803,108 +807,6 @@ def fix_flips_right(
     return poses
 
 
-def detect_and_fix_all_persistent_flips_left(twist_list, poses, joint_idx, axis, threshold=40):
-    T = len(twist_list)
-    fixed = np.zeros(T, dtype=bool)  # Track already-fixed frames
-
-    i = 0
-    while i < T - 1:
-        delta = twist_list[i + 1] - twist_list[i]
-        if abs(delta) > threshold:
-            jump = delta
-            flip_idx = i + 1
-
-            left_abnormal = any(
-                (tw > 90 or tw < -110) and not fixed[t]
-                for t, tw in enumerate(twist_list[:flip_idx])
-            )
-            right_abnormal = any(
-                (tw > 90 or tw < -110) and not fixed[t]
-                for t, tw in enumerate(twist_list[flip_idx:])
-            )
-
-            if left_abnormal:
-                print(f"🛠 Flip detected at frame {flip_idx}: fixing LEFT (0 to {flip_idx - 1}) by {jump:.1f}°")
-                for t in range(0, flip_idx):
-                    if not fixed[t]:
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, jump
-                        )
-                        fixed[t] = True
-
-                # Adjust twist_list after rotation (optional: recompute from scratch instead)
-                for t in range(0, flip_idx):
-                    twist_list[t] += jump
-
-            elif right_abnormal:
-                print(f"🛠 Flip detected at frame {flip_idx}: fixing RIGHT ({flip_idx} to T) by {-jump:.1f}°")
-                for t in range(flip_idx, T):
-                    if not fixed[t]:
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, -jump
-                        )
-                        fixed[t] = True
-
-                for t in range(flip_idx, T):
-                    twist_list[t] -= jump
-
-            # Skip ahead to avoid infinite loops on same segment
-            i = flip_idx
-        else:
-            i += 1
-
-def detect_and_fix_all_persistent_flips_right(twist_list, poses, joint_idx, axis, threshold=40):
-    T = len(twist_list)
-    fixed = np.zeros(T, dtype=bool)  # Track already-fixed frames
-
-    i = 0
-    while i < T - 1:
-        delta = twist_list[i + 1] - twist_list[i]
-        if abs(delta) > threshold:
-            jump = delta
-            flip_idx = i + 1
-
-            left_abnormal = any(
-                (tw > 110 or tw < -90) and not fixed[t]
-                for t, tw in enumerate(twist_list[:flip_idx])
-            )
-            right_abnormal = any(
-                (tw > 110 or tw < -90) and not fixed[t]
-                for t, tw in enumerate(twist_list[flip_idx:])
-            )
-
-            if left_abnormal:
-                print(f"🛠 Flip detected at frame {flip_idx}: fixing LEFT (0 to {flip_idx - 1}) by {jump:.1f}°")
-                for t in range(0, flip_idx):
-                    if not fixed[t]:
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, jump
-                        )
-                        fixed[t] = True
-                        twist_list[t] += jump
-
-                # Adjust twist_list after rotation (optional: recompute from scratch instead)
-                # for t in range(0, flip_idx):
-                #     twist_list[t] += jump
-
-            elif right_abnormal:
-                print(f"🛠 Flip detected at frame {flip_idx}: fixing RIGHT ({flip_idx} to T) by {-jump:.1f}°")
-                for t in range(flip_idx, T):
-                    if not fixed[t]:
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                            poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, -jump
-                        )
-                        fixed[t] = True
-                        twist_list[t] -= jump
-
-                # for t in range(flip_idx, T):
-                #     twist_list[t] -= jump
-
-            # Skip ahead to avoid infinite loops on same segment
-            i = flip_idx
-        else:
-            i += 1
-
 def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joint_idx, axis, human_joints=None, object_verts=None, jump_thresh=20):
     """
     Fixes wrist flips:
@@ -917,7 +819,7 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
 
     out_of_bounds = [(tw > 90 or tw < -110) for tw in twist_list]
     twist_array = np.array(twist_list, dtype=np.float32)
-    
+    specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='left', contact_thresh=0.09)
     # Calculate proportion of frames where hand is in contact but not in correct orientation
     # Move tensors to CPU for numpy operations
     contact_mask_cpu = contact_mask.bool().cpu()
@@ -948,7 +850,8 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
             large_jump_indices,         # 所有 |twist[t+1]−twist[t]|>threshold 的 t 索引
             joint_idx,                   # 要修正的手腕 joint 在 poses 中的索引
             poses,                # (T, D) 每帧的 axis‐angle pose 向量打平后的数组
-            axis                 # (3,) 骨骼轴（例如肘到腕的单位向量）
+            axis,                 # (3,) 骨骼轴（例如肘到腕的单位向量）
+            specific_angles      # (T,) 每帧的手掌与物体的角度
         )        # Detect and fix all persistent flips
         # detect_and_fix_all_persistent_flips_left(twist_list, poses, joint_idx, axis, threshold=jump_thresh)
 
@@ -958,7 +861,6 @@ def robust_wrist_flip_fix_left(twist_list, contact_mask, orient_mask, poses, joi
         
         if human_joints is not None and object_verts is not None:
             # Calculate specific angles using the palm-object angle function
-            specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='left', contact_thresh=0.09)
             
             for t in range(T):
                 if contact_mask_cpu[t] and not orient_mask_cpu[t]:
@@ -1003,7 +905,8 @@ def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, jo
 
     out_of_bounds = [(tw < -90 or tw > 110) for tw in twist_list]
     twist_array = np.array(twist_list, dtype=np.float32)
-    
+    specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='right', contact_thresh=0.09)
+                
     # Calculate proportion of frames where hand is in contact but not in correct orientation
     # Move tensors to CPU for numpy operations
     contact_mask_cpu = contact_mask.bool().cpu()
@@ -1035,7 +938,8 @@ def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, jo
             large_jump_indices,         # 所有 |twist[t+1]−twist[t]|>threshold 的 t 索引
             joint_idx,                   # 要修正的手腕 joint 在 poses 中的索引
             poses,                # (T, D) 每帧的 axis‐angle pose 向量打平后的数组
-            axis                 # (3,) 骨骼轴（例如肘到腕的单位向量）
+            axis,                 # (3,) 骨骼轴（例如肘到腕的单位向量）
+            specific_angles      # (T,) 每帧的手掌与物体的角度
         )        # Detect and fix all persistent flips
     # if orient mask is false when contact mask is true at the same frame for 0.7 of the frames, apply global correction as well
     
@@ -1049,7 +953,6 @@ def robust_wrist_flip_fix_right(twist_list, contact_mask, orient_mask, poses, jo
             
             if human_joints is not None and object_verts is not None:
                 # Calculate specific angles using the palm-object angle function
-                specific_angles = compute_palm_object_angle(human_joints, object_verts, hand='right', contact_thresh=0.09)
                 
                 for t in range(T):
                     if contact_mask_cpu[t] and not orient_mask_cpu[t]:
@@ -1228,8 +1131,6 @@ def main(dataset_path, sequence_name):
     contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
         joints, object_verts, hand='left'
     )
-    for i in range(T):
-        print(f"Frame {i} contact_mask_l: {contact_mask_l[i]} orient_mask_l: {orient_mask_l[i]}")
     contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
         joints, object_verts, hand='right'
     )

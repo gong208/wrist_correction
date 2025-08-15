@@ -17,7 +17,7 @@ def c2rgba(c):
     return c
 
 def visualize_body_obj(body_verts, body_face, obj_verts, obj_face, save_path,
-                       multi_angle=False, h=512, w=512, bg_color='white', show_frame=True,
+                       multi_angle=False, h=768, w=768, bg_color='white', show_frame=True,
                        highlight_frame=None, highlight_vertex=None):
     """Visualize body and object with optional highlight for a specific frame and vertex."""
     import os

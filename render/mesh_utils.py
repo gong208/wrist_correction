@@ -80,7 +80,7 @@ class MeshViewer(object):
 
         rotate=trimesh.transformations.rotation_matrix(np.radians(-30.0),
                                                        [1,0,0])
-        camera_pose[:3, 3] = np.array([0, 2, 3.5])
+        camera_pose[:3, 3] = np.array([0, 2, 2.2])
 
         camera_pose = np.dot(camera_pose, rotate)
 

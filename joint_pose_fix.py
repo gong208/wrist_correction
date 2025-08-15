@@ -448,9 +448,8 @@ def calculate_axis_angle_difference(pose1, pose2):
     # Convert axis-angle to rotation objects
     rot1 = Rotation.from_rotvec(pose1)
     rot2 = Rotation.from_rotvec(pose2)
-    
-    # Calculate the relative rotation
-    relative_rot = rot1.inv() * rot2
+    # Calculate the relative rotation using matrix multiplication
+    relative_rot = rot1.inv()* rot2
     
     # Get the rotation angle in degrees
     angle_diff = np.rad2deg(relative_rot.magnitude())
@@ -619,12 +618,15 @@ def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, re
                 seg_start, seg_end = right_start, right_end
                 jump_angle = -angle_diffs[flip_idx]
                 print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (more out-of-bounds)")
-            elif left_oob_count == right_oob_count and left_oob_count > 0:
+            elif left_oob_count == right_oob_count:
                 # Equal out-of-bounds, use segment length as tiebreaker
                 left_length = left_end - left_start + 1
                 right_length = right_end - right_start + 1
-                
-                if left_length > right_length:
+                if left_start == 0:
+                    seg_start, seg_end = left_start, left_end
+                    jump_angle = angle_diffs[flip_idx]
+                    print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (longer segment)")
+                elif left_length < right_length:
                     seg_start, seg_end = left_start, left_end
                     jump_angle = angle_diffs[flip_idx]
                     print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (longer segment)")
@@ -665,7 +667,7 @@ def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, re
             next_flip = next_flip_idx
         
         # Determine fixing method based on segment length
-        if segment_length <= 10 and is_between_flips and prev_flip is not None and next_flip is not None:
+        if segment_length <= 0 and is_between_flips:
             # Use interpolation for short segments between flips
             print(f"    Segment [{seg_start},{seg_end}] (length={segment_length}) is between flips {prev_flip} and {next_flip} - using interpolation")
             
@@ -879,7 +881,7 @@ def fix_all_joint_poses(poses, joints, object_verts, canonical_joints, threshold
         prev_total_flips = total_flips
         
         # Safety check to prevent infinite loops
-        if iteration > 5:
+        if iteration > 20:
             print(f"  Reached maximum iterations (20) - stopping")
             break
     
