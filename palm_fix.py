@@ -225,7 +225,7 @@ def visualize_smpl(name, MOTION_PATH, model_type, num_betas, use_pca=False):
     OMOMO for SMPLX 16
     vertices: (N, 10475, 3)
     """
-    with np.load(os.path.join(MOTION_PATH, name, 'human.npz'), allow_pickle=True) as f:
+    with np.load(os.path.join(MOTION_PATH, name, 'joint_fixed.npz'), allow_pickle=True) as f:
         poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
     print(f"motion loaded: {os.path.join(MOTION_PATH, name, 'human.npz')}")
     frame_times = poses.shape[0]
@@ -744,8 +744,8 @@ def fix_flips_right(
         if math.isclose(left_bad_ratio, right_bad_ratio, rel_tol=1e-6):
             print(f"⚠️ Flip {t} 的左右段 orientation 比例相同：{left_bad_ratio:.2f} vs {right_bad_ratio:.2f}")
             # Use twist out-of-bounds as first tiebreaker
-            left_oob  = ((twist_angles[left_start:left_end] > 110) |
-                         (twist_angles[left_start:left_end] < -90)).sum()
+            left_oob  = ((twist_angles[left_start:left_end] > 90) |
+                         (twist_angles[left_start:left_end] < -110)).sum()
             right_oob = ((twist_angles[right_start:right_end] > 110) |
                          (twist_angles[right_start:right_end] < -90)).sum()
             print(f"    Twist OOB tiebreaker: left={left_oob}, right={right_oob}")
@@ -1131,6 +1131,7 @@ def main(dataset_path, sequence_name):
     contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
         joints, object_verts, hand='left'
     )
+    print("Frames where orient_mask_l == 1:", torch.where(orient_mask_l == 1)[0].cpu().numpy())
     contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
         joints, object_verts, hand='right'
     )

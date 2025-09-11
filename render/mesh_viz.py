@@ -69,7 +69,7 @@ def visualize_body_obj(body_verts, body_face, obj_verts, obj_face, save_path,
 
     for i in range(seqlen):
         # Set object mesh color (pink)
-        rgba_color = np.concatenate([c2rgba(colors['pink'])[:3], [1]])  # RGB + Alpha
+        rgba_color = np.concatenate([c2rgba(colors['pink'])[:3], [0.5]])  # RGB + Alpha
         obj_mesh_color = np.tile(rgba_color, (obj_mesh_rec.shape[1], 1))
         obj_m_rec = trimesh.Trimesh(vertices=obj_mesh_rec[i],
                                     faces=obj_face,

@@ -133,9 +133,14 @@ def visualize_smpl(name, MOTION_PATH, model_type, num_betas, use_pca=False, use_
         human_file = 'joint_fixed.npz'
     else:
         human_file = 'human.npz'
-    
-    with np.load(os.path.join(MOTION_PATH, name, human_file), allow_pickle=True) as f:
-        poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
+    if use_fixed:
+        # with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step2.5_smoothed.npz'), allow_pickle=True) as f:
+        # with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step2_palm_fixed.npz'), allow_pickle=True) as f:
+        with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step1_joint_fixed.npz'), allow_pickle=True) as f:
+            poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
+    else:
+        with np.load(os.path.join(MOTION_PATH, name, human_file), allow_pickle=True) as f:
+            poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
     
     print(f"Motion loaded: {os.path.join(MOTION_PATH, name, human_file)}")
     frame_times = poses.shape[0]
@@ -306,7 +311,7 @@ def main():
         object_verts.detach().cpu().numpy(),
         object_faces,
         save_path=output_path,
-        multi_angle=args.multi_angle,
+        multi_angle=True,
         show_frame=True
     )
     
