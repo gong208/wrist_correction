@@ -15,7 +15,7 @@ device = torch.device(f"cuda:{DEVICE_NUMBER}" if torch.cuda.is_available() else 
 print(f"Using device: {device}")
 
 # SMPLX model paths
-SMPLX_PATH = '../models/smplx'
+SMPLX_PATH = 'models/smplx'
 surface_model_male_fname = os.path.join(SMPLX_PATH, "SMPLX_MALE.npz")
 surface_model_female_fname = os.path.join(SMPLX_PATH, "SMPLX_FEMALE.npz")
 
@@ -57,7 +57,7 @@ def visualize_optimized_sequence(sequence_name, optimized_hand_pose_path, output
     """
     
     # Load original sequence data
-    OMOMO_DATA_ROOT = '../gt/omomo/sequences_canonical'
+    OMOMO_DATA_ROOT = 'data/omomo/sequences_canonical'
     sequence_path = os.path.join(OMOMO_DATA_ROOT, sequence_name)
     
     # Load human data
@@ -78,7 +78,7 @@ def visualize_optimized_sequence(sequence_name, optimized_hand_pose_path, output
     sbj_m = sbj_m_all[gender]
     
     # Load object mesh
-    OBJ_PATH = '../gt/omomo/objects'
+    OBJ_PATH = 'data/omomo/objects'
     obj_dir_name = os.path.join(OBJ_PATH, obj_name)
     MMESH = trimesh.load(os.path.join(obj_dir_name, obj_name + '.obj'))
     verts_obj = np.array(MMESH.vertices)
@@ -154,7 +154,7 @@ def main():
         print(f"Error: Optimized hand pose file not found: {args.optimized_hand_pose_path}")
         return
     
-    OMOMO_DATA_ROOT = '../gt/omomo/sequences_canonical'
+    OMOMO_DATA_ROOT = 'data/omomo/sequences_canonical'
     sequence_path = os.path.join(OMOMO_DATA_ROOT, args.sequence_name)
     if not os.path.exists(sequence_path):
         print(f"Error: Sequence not found: {sequence_path}")

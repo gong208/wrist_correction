@@ -124,23 +124,15 @@ smplx16_model_neutral = BodyModel(bm_fname=surface_model_neutral_fname,
         dmpl_fname=dmpl_fname)
 smplx16 = {'male': smplx16_model_male, 'female': smplx16_model_female, 'neutral': smplx16_model_neutral}
 
-def visualize_smpl(name, MOTION_PATH, model_type, num_betas, use_pca=False, use_fixed=False):
+def visualize_smpl(name, MOTION_PATH, model_type, num_betas, use_pca=False):
     """
     Load and visualize SMPL data for a single sequence
     """
     # Choose between original and fixed pose file
-    if use_fixed:
-        human_file = 'joint_fixed.npz'
-    else:
-        human_file = 'human.npz'
-    if use_fixed:
-        # with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step2.5_smoothed.npz'), allow_pickle=True) as f:
-        # with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step2_palm_fixed.npz'), allow_pickle=True) as f:
-        with np.load(os.path.join('save_pipeline_fix', 'omomo', name + '_step1_joint_fixed.npz'), allow_pickle=True) as f:
-            poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
-    else:
-        with np.load(os.path.join(MOTION_PATH, name, human_file), allow_pickle=True) as f:
-            poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
+
+    human_file = 'human.npz'
+    with np.load(os.path.join(MOTION_PATH, name, human_file), allow_pickle=True) as f:
+        poses, betas, trans, gender = f['poses'], f['betas'], f['trans'], str(f['gender'])
     
     print(f"Motion loaded: {os.path.join(MOTION_PATH, name, human_file)}")
     frame_times = poses.shape[0]
@@ -204,10 +196,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize a single sequence from a dataset")
     parser.add_argument("--dataset_path", required=True, help="Path to the root of the dataset")
     parser.add_argument("--sequence_name", required=True, help="Name of the sequence to visualize")
-    parser.add_argument("--use_fixed", action="store_true", help="Use palm_fixed.npz instead of human.npz")
     parser.add_argument("--output_path", default="./visualization_output", help="Output directory for rendered video")
-    parser.add_argument("--highlight_frame", type=int, help="Highlight a specific frame")
-    parser.add_argument("--highlight_vertex", type=int, help="Highlight a specific vertex")
     parser.add_argument("--multi_angle", action="store_true", help="Render from multiple angles")
     
     args = parser.parse_args()
@@ -216,20 +205,16 @@ def main():
     human_path = os.path.join(args.dataset_path, 'sequences_canonical')
     object_path = os.path.join(args.dataset_path, 'objects')
     dataset_name = args.dataset_path.split('/')[-1]
-    
+    human_file = 'human.npz'
     # Check if sequence exists
     sequence_path = os.path.join(human_path, args.sequence_name)
     if not os.path.exists(sequence_path):
         print(f"Error: Sequence {args.sequence_name} not found in {human_path}")
         return
     
-    # Check if human file exists
-    human_file = 'palm_fixed.npz' if args.use_fixed else 'human.npz'
     human_file_path = os.path.join(sequence_path, human_file)
     if not os.path.exists(human_file_path):
         print(f"Error: {human_file} not found in {sequence_path}")
-        if args.use_fixed:
-            print("Try running without --use_fixed to use the original human.npz file")
         return
     
     print(f"Visualizing sequence: {args.sequence_name}")
@@ -239,19 +224,19 @@ def main():
     # Load human data based on dataset type
     if dataset_name.upper() == 'BEHAVE' or dataset_name.upper() == 'BEHAVE_CORRECT':
         verts, joints, faces, poses, betas, trans, gender = visualize_smpl(
-            args.sequence_name, human_path, 'smplh', 10, use_fixed=args.use_fixed)
+            args.sequence_name, human_path, 'smplh', 10)
     elif dataset_name.upper() == 'NEURALDOME' or dataset_name.upper() == 'IMHD':
         verts, joints, faces, poses, betas, trans, gender = visualize_smpl(
-            args.sequence_name, human_path, 'smplh', 16, use_fixed=args.use_fixed)
+            args.sequence_name, human_path, 'smplh', 16)
     elif dataset_name.upper() == 'CHAIRS':
         verts, joints, faces, poses, betas, trans, gender = visualize_smpl(
-            args.sequence_name, human_path, 'smplx', 10, use_fixed=args.use_fixed)
+            args.sequence_name, human_path, 'smplx', 10)
     elif dataset_name.upper() == 'INTERCAP' or dataset_name.upper() == 'INTERCAP_CORRECT':
         verts, joints, faces, poses, betas, trans, gender = visualize_smpl(
-            args.sequence_name, human_path, 'smplx', 10, True, use_fixed=args.use_fixed)
+            args.sequence_name, human_path, 'smplx', 10, True)
     elif dataset_name.upper() == 'OMOMO' or dataset_name.upper() == 'OMOMO_CORRECT':
         verts, joints, faces, poses, betas, trans, gender = visualize_smpl(
-            args.sequence_name, human_path, 'smplx', 16, use_fixed=args.use_fixed)
+            args.sequence_name, human_path, 'smplx', 16)
     else:
         print(f"Error: Unsupported dataset type: {dataset_name}")
         return
@@ -299,8 +284,7 @@ def main():
     os.makedirs(args.output_path, exist_ok=True)
     
     # Generate output filename
-    suffix = "_fixed" if args.use_fixed else ""
-    output_filename = f"{args.sequence_name}{suffix}.mp4"
+    output_filename = f"{args.sequence_name}.mp4"
     output_path = os.path.join(args.output_path, output_filename)
     
     # Render visualization
@@ -311,7 +295,7 @@ def main():
         object_verts.detach().cpu().numpy(),
         object_faces,
         save_path=output_path,
-        multi_angle=True,
+        multi_angle=args.multi_angle,
         show_frame=True
     )
     

@@ -1,10 +1,10 @@
 # Comprehensive Pipeline: Joint Pose Fix + Palm Fix + Optimization
 import sys
-from render.mesh_viz import visualize_body_obj
-# from validate_hand_indices import visualize_body_obj
+
 import math
 from scipy.spatial.distance import cdist
-from utils import vertex_normals
+
+
 import os
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 import smplx
@@ -16,12 +16,12 @@ import torch.nn.functional as F
 import numpy as np
 from pytorch3d.ops import cot_laplacian
 from pytorch3d.structures import Meshes
-from pytorch3d.transforms import matrix_to_euler_angles,axis_angle_to_matrix, matrix_to_axis_angle,rotation_6d_to_matrix,matrix_to_rotation_6d
+from pytorch3d.transforms import axis_angle_to_matrix,rotation_6d_to_matrix,matrix_to_rotation_6d
 from torch.autograd import Variable
 import torch.optim as optim
 import copy
 import argparse
-from prior import *
+
 from human_body_prior.tools import tgm_conversion as tgm
 import chamfer_distance as chd
 from scipy.spatial.transform import Rotation
@@ -31,10 +31,17 @@ to_cpu = lambda tensor: tensor.detach().cpu()
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R, Slerp
 from human_body_prior.body_model.body_model import BodyModel
+
+import pickle
+import random
+import time
+
+from utils import vertex_normals
+from render.mesh_viz import visualize_body_obj
 from bone_lists import bone_list_behave, bone_list_omomo
 from loss import point2point_signed
-import pickle
-import time
+from prior import *
+
 # Joint indices
 LEFT_COLLAR = 13
 RIGHT_COLLAR = 14
@@ -454,14 +461,18 @@ def detect_hand_twist_from_canonical_batch(poses, joints_canonical):
     T = poses.shape[0]
     twist_left_list = []
     twist_right_list = []
-    
+    elbow_left_list = []
+    elbow_right_list = []
     for frame_idx in range(T):
         pose_i = poses[frame_idx].reshape(52, 3)
         twist_left, twist_right = detect_hand_twist_from_canonical(pose_i, joints_canonical)
+        elbow_left, elbow_right = detect_elbow_twist_from_canonical(pose_i, joints_canonical)
         twist_left_list.append(twist_left)
         twist_right_list.append(twist_right)
+        elbow_left_list.append(elbow_left)
+        elbow_right_list.append(elbow_right)
     
-    return twist_left_list, twist_right_list
+    return twist_left_list, twist_right_list, elbow_left_list, elbow_right_list
 
 def detect_hand_twist_from_canonical(pose_i, joints_canonical):
     """Detect wrist twist angles using canonical bone axis"""
@@ -486,171 +497,29 @@ def detect_hand_twist_from_canonical(pose_i, joints_canonical):
 
     return twist_left, twist_right
 
-def fix_joint_poses(poses, flip_indices, orient_mask, joint_idx, angle_diffs, relative_axes, canonical_joints, threshold=20, left_twist_bound_mask=None, right_twist_bound_mask=None):
-    """
-    Fix joint poses based on flip detection and orientation mask.
-    Process flips sequentially and check if segments have already been fixed.
-    
-    Args:
-        poses: (T, 156) pose parameters to fix
-        flip_indices: list of frame indices where flips occur
-        orient_mask: (T,) bool tensor, True when orientation is correct
-        joint_idx: joint index to fix
-        angle_diffs: list of angle differences between consecutive frames
-        relative_axes: list of relative rotation axes between consecutive frames
-        canonical_joints: (J, 3) canonical joint positions in rest pose
-        threshold: angle threshold in degrees
-        left_twist_bound_mask: list of bool indicating left wrist out-of-bounds frames (optional)
-        right_twist_bound_mask: list of bool indicating right wrist out-of-bounds frames (optional)
-    
-    Returns:
-        tuple: (fixed poses, list of frame indices that were actually fixed)
-    """
-    T = poses.shape[0]
-    pose_start = JOINT_TO_POSE_MAPPING[joint_idx]
-    fixed_poses = poses.copy()
-    
-    if not flip_indices:
-        return fixed_poses, []
-    
-    print(f"Fixing joint {joint_idx} with {len(flip_indices)} flips detected")
-    
-    # Track which frames have been fixed to avoid repeated fixing
-    fixed = np.zeros(T, dtype=bool)
-    
-    # Process flips sequentially
-    for i, flip_idx in enumerate(flip_indices):
-        print(f"  Processing flip {i+1}/{len(flip_indices)} at frame {flip_idx}")
-        
-        # Find the previous flip (if any)
-        prev_flip_idx = None
-        if i > 0:
-            prev_flip_idx = flip_indices[i-1]
-        
-        # Find the next flip (if any)
-        next_flip_idx = None
-        if i + 1 < len(flip_indices):
-            next_flip_idx = flip_indices[i + 1]
-        
-        # Define segments for this flip
-        left_start = 0 if prev_flip_idx is None else prev_flip_idx + 1
-        left_end = flip_idx
-        right_start = flip_idx + 1
-        right_end = T - 1 if next_flip_idx is None else next_flip_idx
-        
-        # Special handling for consecutive flips
-        if next_flip_idx is not None and next_flip_idx == flip_idx + 1:
-            if i + 2 < len(flip_indices):
-                right_end = flip_indices[i + 2]
-            else:
-                right_end = T - 1
-            print(f"    Consecutive flip detected: adjusting right segment to [{right_start},{right_end}]")
-        
-        if prev_flip_idx is not None and prev_flip_idx == flip_idx - 1:
-            if i > 1:
-                left_start = flip_indices[i - 2] + 1
-            else:
-                left_start = 0
-            print(f"    Consecutive flip detected: adjusting left segment to [{left_start},{left_end}]")
-        
-        print(f"    Segments for flip {flip_idx}: left=[{left_start},{left_end}], right=[{right_start},{right_end}]")
-        
-        # Calculate orientation proportion for each segment
-        left_orient_ratio = orient_mask[left_start:left_end+1].float().mean().item() if left_end >= left_start else 0.0
-        right_orient_ratio = orient_mask[right_start:right_end+1].float().mean().item() if right_end >= right_start else 0.0
-        
-        print(f"    Orientation ratios: left={left_orient_ratio:.3f}, right={right_orient_ratio:.3f}")
-        
-        # Check if both segments have 0 orientation frames
-        left_no_orient = left_orient_ratio == 0.0
-        right_no_orient = right_orient_ratio == 0.0
-        
-        if left_no_orient and right_no_orient:
-            print(f"    Both segments have 0 orientation frames - using twist angle bound analysis")
-            if joint_idx in [LEFT_COLLAR, LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST] and left_twist_bound_mask is not None:
-                left_oob_count = sum(left_twist_bound_mask[left_start:left_end+1]) if left_end >= left_start else 0
-                right_oob_count = sum(left_twist_bound_mask[right_start:right_end+1]) if right_end >= right_start else 0
-            elif joint_idx in [RIGHT_COLLAR, RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST] and right_twist_bound_mask is not None:
-                left_oob_count = sum(right_twist_bound_mask[left_start:left_end+1]) if left_end >= left_start else 0
-                right_oob_count = sum(right_twist_bound_mask[right_start:right_end+1]) if right_end >= right_start else 0
-            else:
-                left_oob_count = 0
-                right_oob_count = 0
-            
-            print(f"    Left segment out-of-bounds: {left_oob_count}/{left_end-left_start+1}")
-            print(f"    Right segment out-of-bounds: {right_oob_count}/{right_end-right_start+1}")
-            
-            if left_oob_count > right_oob_count:
-                seg_start, seg_end = left_start, left_end
-                jump_angle = angle_diffs[flip_idx]
-                print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (more out-of-bounds)")
-            elif right_oob_count > left_oob_count:
-                seg_start, seg_end = right_start, right_end
-                jump_angle = -angle_diffs[flip_idx]
-                print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (more out-of-bounds)")
-            elif left_oob_count == right_oob_count:
-                left_length = left_end - left_start + 1
-                right_length = right_end - right_start + 1
-                
-                if left_length < right_length:
-                    seg_start, seg_end = left_start, left_end
-                    jump_angle = angle_diffs[flip_idx]
-                    print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (shorter segment)")
-                else:
-                    seg_start, seg_end = right_start, right_end
-                    jump_angle = -angle_diffs[flip_idx]
-                    print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}° (shorter segment)")
-        else:
-            if left_orient_ratio < right_orient_ratio:
-                seg_start, seg_end = left_start, left_end
-                jump_angle = angle_diffs[flip_idx]
-                print(f"    Fixing LEFT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
-            else:
-                seg_start, seg_end = right_start, right_end
-                jump_angle = -angle_diffs[flip_idx]
-                print(f"    Fixing RIGHT segment [{seg_start},{seg_end}] by {jump_angle:.1f}°")
-        
-        # Check if the segment to be fixed is already mostly fixed
-        fixed_ratio = fixed[np.arange(seg_start, seg_end + 1)].mean()
-        if fixed_ratio > 0.8:
-            print(f"    Segment [{seg_start},{seg_end}] already {fixed_ratio:.1%} fixed - skipping")
-            continue
-        
-        segment_length = seg_end - seg_start + 1
-        is_between_flips = False
-        if seg_start > 0 and seg_end < T - 1:
-            is_between_flips = True
-            prev_flip = prev_flip_idx
-            next_flip = next_flip_idx
-        #  and is_between_flips and prev_flip is not None and next_flip is not None:
-        if segment_length <= 10:
-            print(f"    Segment [{seg_start},{seg_end}] (length={segment_length})")
-            pose_before = fixed_poses[seg_start - 1, pose_start:pose_start+3]
-            pose_after = fixed_poses[seg_end + 1, pose_start:pose_start+3]
-            
-            for t in range(seg_start, seg_end + 1):
-                alpha = (t - seg_start) / (seg_end - seg_start) if seg_end > seg_start else 0.0
-                fixed_poses[t, pose_start:pose_start+3] = interpolate_pose(pose_before, pose_after, alpha)
-                fixed[t] = True
-        else:
-            if segment_length > 10:
-                print(f"    Segment [{seg_start},{seg_end}] (length={segment_length}) is too long - using angle reversal")
-            else:
-                print(f"    Segment [{seg_start},{seg_end}] (length={segment_length}) includes boundary frames - using angle reversal")
-            
-            rotation_axis = relative_axes[flip_idx]
-            print(f"    Using relative rotation axis from flip: [{rotation_axis[0]:.3f}, {rotation_axis[1]:.3f}, {rotation_axis[2]:.3f}]")
-            
-            for t in range(seg_start, seg_end + 1):
-                pose_vec = fixed_poses[t, pose_start:pose_start+3]
-                fixed_poses[t, pose_start:pose_start+3] = rotate_pose_around_axis(
-                    pose_vec, rotation_axis, jump_angle
-                )
-                fixed[t] = True
-    
-    # Return the fixed poses and the list of frames that were actually fixed
-    fixed_frame_indices = np.where(fixed)[0].tolist()
-    return fixed_poses, fixed_frame_indices
+def detect_elbow_twist_from_canonical(pose_i, joints_canonical):
+    """Detect wrist twist angles using canonical bone axis"""
+    def compute_twist_angle(pose_wrist, bone_axis):
+        rotvec = pose_wrist
+        angle = np.linalg.norm(rotvec)
+        if angle < 1e-6:
+            return 0.0
+        axis = rotvec / angle
+        twist_cos = np.dot(axis, bone_axis)
+        twist_angle = angle * twist_cos
+        return np.rad2deg(twist_angle)
+
+    bone_axis_left = joints_canonical[LEFT_ELBOW] - joints_canonical[LEFT_SHOULDER]
+    bone_axis_left /= np.linalg.norm(bone_axis_left)
+
+    bone_axis_right = joints_canonical[RIGHT_ELBOW] - joints_canonical[RIGHT_SHOULDER]
+    bone_axis_right /= np.linalg.norm(bone_axis_right)
+
+    twist_left = compute_twist_angle(pose_i[LEFT_ELBOW], bone_axis_left)
+    twist_right = compute_twist_angle(pose_i[RIGHT_ELBOW], bone_axis_right)
+
+    return twist_left, twist_right
+
 
 def rotate_pose_around_axis(pose_vec, axis, angle_deg):
     """Rotate pose around given axis"""
@@ -658,6 +527,19 @@ def rotate_pose_around_axis(pose_vec, axis, angle_deg):
     R_correction = R.from_rotvec(np.deg2rad(angle_deg) * axis).as_matrix()
     R_fixed = R_current @ R_correction
     return R.from_matrix(R_fixed).as_rotvec()
+
+
+def _signed_angle(u, v, r, eps=1e-8):
+    """Signed angle from u to v about axis r, in radians, in (-pi, pi]."""
+    u = F.normalize(u, dim=-1, eps=eps)
+    v = F.normalize(v, dim=-1, eps=eps)
+    r = F.normalize(r, dim=-1, eps=eps)
+    cross_uv = torch.cross(u, v, dim=-1)          # (...,3)
+    sin_term = (cross_uv * r).sum(dim=-1)         # dot(r, cross(u,v))
+    cos_term = (u * v).sum(dim=-1)                # dot(u, v)
+    return torch.atan2(sin_term, cos_term)
+
+
 
 def compute_palm_object_angle(
     human_joints: torch.Tensor,       # (T, J, 3)
@@ -681,10 +563,10 @@ def compute_palm_object_angle(
 
     # --- select palm joints ---
     if hand.lower().startswith('r'):
-        IDX_WRIST, IDX_INDEX, IDX_PINKY = 21, 40, 46
+        IDX_WRIST, IDX_INDEX, IDX_PINKY = 21, 42, 48
         flip_normal = False
     else:
-        IDX_WRIST, IDX_INDEX, IDX_PINKY = 20, 25, 31
+        IDX_WRIST, IDX_INDEX, IDX_PINKY = 20, 27, 36
         flip_normal = True
 
     wrist = human_joints[:, IDX_WRIST, :]
@@ -724,88 +606,6 @@ def compute_palm_object_angle(
 
     return angles.detach().cpu().numpy()
 
-def compute_palm_object_angle_old(
-    human_joints: torch.Tensor,       # (T, J, 3)
-    object_verts: torch.Tensor,       # (T, N, 3)
-    hand: str = 'left',               # 'left' or 'right'
-    contact_thresh: float = 0.07      # contact distance threshold
-):
-    """
-    Compute the angle between palm normal and vector from palm center to nearest object vertices.
-    Returns the angle in degrees for each frame.
-    """
-    # 0) 预处理：同设备
-    if human_joints.device != object_verts.device:
-        human_joints = human_joints.to(object_verts.device)
-    T, J, _ = human_joints.shape
-
-    # 1) 选关节索引 & 法线翻转
-    hand = hand.lower()
-    if hand.startswith('r'):
-        # 右手索引
-        IDX_WRIST     = 21
-        IDX_INDEX     = 40
-        IDX_PINKY     = 46
-        flip_normal   = False
-    else:
-        # 左手索引
-        IDX_WRIST     = 20
-        IDX_INDEX     = 25
-        IDX_PINKY     = 31
-        flip_normal   = True
-
-    # 2) 提取关节位置
-    wrist = human_joints[:, IDX_WRIST, :]  # (T,3)
-    idx   = human_joints[:, IDX_INDEX, :]  # (T,3)
-    pinky = human_joints[:, IDX_PINKY, :]  # (T,3)
-
-    # 3) 计算法线 & 归一化
-    v1 = idx   - wrist   # (T,3)
-    v2 = pinky - wrist   # (T,3)
-    normals = torch.cross(v1, v2, dim=1)  # (T,3)
-    if flip_normal:
-        normals = -normals
-    normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
-
-    # 4) 计算手掌质心
-    centroid = (wrist + idx + pinky) / 3.0  # (T,3)
-
-    # 5) 计算所有顶点相对向量 & 距离
-    rel = object_verts - centroid.unsqueeze(1)   # (T, N, 3)
-    dists = rel.norm(dim=2)                     # (T, N)
-
-    # 6) 找到最近的接触点
-    contact_mask = (dists < contact_thresh)  # (T, N)
-    
-    angles = torch.zeros(T, device=human_joints.device)
-    
-    for t in range(T):
-        if contact_mask[t].any():
-            # 找到最近的接触点
-            contact_dists = dists[t][contact_mask[t]]
-            contact_rel = rel[t][contact_mask[t]]
-            
-            # 找到最近的接触点
-            min_idx = torch.argmin(contact_dists)
-            nearest_rel = contact_rel[min_idx]
-            
-            # 归一化相对向量
-            nearest_rel_norm = nearest_rel / (nearest_rel.norm() + 1e-8)
-            
-            # 计算余弦值
-            cosine = torch.dot(normals[t], nearest_rel_norm)
-            cosine = torch.clamp(cosine, -1.0, 1.0)  # 确保在有效范围内
-            
-            # 计算角度
-            angle_rad = torch.acos(cosine)
-            angles[t] = torch.rad2deg(angle_rad)
-        else:
-            # 如果没有接触点，使用默认角度
-            angles[t] = 180.0
-    
-    return angles.cpu().numpy()
-
-
 def fix_left_palm(
     twist_list,
     contact_mask,
@@ -817,7 +617,7 @@ def fix_left_palm(
     object_verts=None,
     object_normals=None,
     contact_thresh=0.09,
-    twist_bounds=( -110.0, 90.0 ),   # (min, max) acceptable wrist twist in degrees
+    twist_bounds=( -110.0, 80.0 ),   # (min, max) acceptable wrist twist in degrees
 ):
     """
     Simplified wrist correction for LEFT hand.
@@ -856,66 +656,33 @@ def fix_left_palm(
     else:
         proportion_out_of_bounds_given_no_contact = 0.0
     
-    print(f"left orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
-    print(f"left out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
+    # print(f"left orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
+    # print(f"left out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
     
     # expects degrees; one angle per frame
     specific_angles = compute_palm_object_angle(
         human_joints, object_verts, object_normals, hand='left'
     )
-       
+    # for t in range(T):
+    #     print(f"frame {t} left hand angle: {specific_angles[t]}, twist angle: {twist_list[t]}")
 
     fixed_frames = []
-    if proportion_wrong_orient_given_contact > 0.7:
-        # If there is contact but wrong orientation proportion is large, calculate specific angle
-        print(f"left Contact with wrong orientation detected - calculating specific angles")
-        
-        if human_joints is not None and object_verts is not None:
-            # Calculate specific angles using the palm-object angle function
-
-            for t in range(T):
-                if contact_mask_cpu[t] and not orient_mask_cpu[t]:
-                    # Use the calculated specific angle
-                    angle = specific_angles[t]
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, angle
-                    )
-                    fixed_frames.append(t)
-                else:
-                    # Apply 180 degree rotation for other cases
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
-                    )
-                    fixed_frames.append(t)
-        else:
-            # Fallback to 180 degrees if data not available
-            for t in range(T):
-                poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
-                )
-                fixed_frames.append(t)
-    elif proportion_out_of_bounds_given_no_contact > 0.7:
-        # If no contact but out of bounds proportion is large, rotate by 180 degrees
-        print(f"left No contact but out of bounds - applying 180° rotation")
-        for t in range(T):
-            poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+    
+    for t in range(T):
+        if out_of_bounds[t]:
+            angle = 0.0
+            if contact_mask_cpu[t]:
+                # print(f"Frame {t} left palm out of bounds while in contact")
+                angle = float(specific_angles[t])
+                if twist_list[t] > 0:
+                    angle = -angle
+            else:
+                # print(f"Frame {t} left palm out of bounds")
+                angle = float(-twist_list[t])
+            poses[t, joint_idx*3 : joint_idx*3 + 3] = rotate_pose_around_axis(
+                poses[t, joint_idx*3 : joint_idx*3 + 3], axis, angle
             )
             fixed_frames.append(t)
-    else:
-        for t in range(T):
-            if out_of_bounds[t]:
-                angle = 0.0
-                if contact_mask_cpu[t]:
-                    print(f"Frame {t} left palm out of bounds while in contact")
-                    angle = float(specific_angles[t])
-                else:
-                    print(f"Frame {t} left palm out of bounds")
-                    angle = float(twist_list[t])
-                poses[t, joint_idx*3 : joint_idx*3 + 3] = rotate_pose_around_axis(
-                    poses[t, joint_idx*3 : joint_idx*3 + 3], axis, angle
-                )
-                fixed_frames.append(t)
 
     return poses, fixed_frames
 
@@ -931,7 +698,7 @@ def fix_right_palm(
     object_verts=None,
     object_normals=None,
     contact_thresh=0.09,
-    twist_bounds=(-90.0, 110.0),   # acceptable right-wrist twist range (deg)
+    twist_bounds=(-80.0, 110.0),   # acceptable right-wrist twist range (deg)
 ):
     """
     Simplified wrist correction for RIGHT hand.
@@ -972,6 +739,8 @@ def fix_right_palm(
     specific_angles = compute_palm_object_angle(
         human_joints, object_verts,object_normals, hand='right'
     )
+    # for t in range(T):
+    #     print(f"frame {t} right hand angle: {specific_angles[t]}, twist angle: {twist_list[t]}")
     # Calculate proportion of out-of-bounds frames among non-contact frames only
     non_contact_frames = (~contact_mask_cpu).sum().item()
     if non_contact_frames > 0:
@@ -980,201 +749,116 @@ def fix_right_palm(
     else:
         proportion_out_of_bounds_given_no_contact = 0.0
     
-    print(f"right orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
-    print(f"right out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
+    # print(f"right orient_mask: {proportion_wrong_orient_given_contact:.3f} (contact frames: {contact_frames})")
+    # print(f"right out_of_bounds: {proportion_out_of_bounds_given_no_contact:.3f} (non-contact frames: {non_contact_frames})")
     fixed_frames = []
-    if proportion_wrong_orient_given_contact > 0.7:
-        # If there is contact but wrong orientation proportion is large, calculate specific angle
-        print(f"right Contact with wrong orientation detected - calculating specific angles")
-        
-        if human_joints is not None and object_verts is not None:
-            # Calculate specific angles using the palm-object angle function
-
-            for t in range(T):
-                if contact_mask_cpu[t] and not orient_mask_cpu[t]:
-                    # Use the calculated specific angle
-                    angle = specific_angles[t]
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, angle
-                    )
-                    fixed_frames.append(t)
-                else:
-                    # Apply 180 degree rotation for other cases
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                        poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
-                    )
-                    fixed_frames.append(t)
-        else:
-            # Fallback to 180 degrees if data not available
-            for t in range(T):
-                poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                    poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
-                )
-                fixed_frames.append(t)
-    elif proportion_out_of_bounds_given_no_contact > 0.7:
-        # If no contact but out of bounds proportion is large, rotate by 180 degrees
-        print(f"right No contact but out of bounds - applying 180° rotation")
-        for t in range(T):
-            poses[t, joint_idx * 3 : joint_idx * 3 + 3] = rotate_pose_around_axis(
-                poses[t, joint_idx * 3 : joint_idx * 3 + 3], axis, 180
+    
+    for t in range(T):
+        # Case 1: in contact but wrong orientation -> use palm-object angle
+        if out_of_bounds[t]:
+            angle = 0.0
+            if contact_mask_cpu[t]:
+                # print(f"Frame {t} right palm out of bounds while in contact")
+                angle = float(specific_angles[t])
+                if twist_list[t] > 0:
+                    angle = -angle
+            else:
+                # print(f"Frame {t} right palm out of bounds")
+                angle = float(-twist_list[t])
+            poses[t, joint_idx*3 : joint_idx*3 + 3] = rotate_pose_around_axis(
+                poses[t, joint_idx*3 : joint_idx*3 + 3], axis, angle
             )
             fixed_frames.append(t)
-    # precompute palm-object angles if geometry available
-
-    else: 
-        for t in range(T):
-            # Case 1: in contact but wrong orientation -> use palm-object angle
-            if out_of_bounds[t]:
-                angle = 0.0
-                if contact_mask_cpu[t]:
-                    print(f"Frame {t} right palm out of bounds while in contact")
-                    angle = float(specific_angles[t])
-                else:
-                    print(f"Frame {t} right palm out of bounds")
-                    angle = float(twist_list[t])
-                poses[t, joint_idx*3 : joint_idx*3 + 3] = rotate_pose_around_axis(
-                    poses[t, joint_idx*3 : joint_idx*3 + 3], axis, angle
-                )
-                fixed_frames.append(t)
             
     return poses, fixed_frames
 
-def compute_reference_loss_selective(poses, reference_poses, fixed_joints_mask, weight=1.0):
-    """Compute reference loss only for fixed joint-frame combinations.
-    
-    This function efficiently computes the difference between optimized poses and reference poses,
-    but only for the specific joint-frame combinations that were influenced by previous steps.
+
+def compute_joints_smoothing_loss(
+    joints,                        # (T, J, 3) torch.Tensor
+    fixed_joints_mask=None,        # (T, 8) bool (collar/shoulder/elbow/wrist L/R), optional
+    joint_optimization_mask=None,  # (8,) bool which of the above 8 joints were optimized, optional
+    hand_joint_ids=None,           # list[int] in 0..J-1; default wrists+fingers
+    neighbor_radius: int = 1,      # include +/- this many frames around fixed ones
+    use_root_relative: bool = True,
+    root_joint_index: int = 0,
+    per_joint_weights=None,        # optional (K,) weights for selected hand joints
+    weight_vel: float = 0.5,
+    weight_accel: float = 0.5,
+):
     """
-    # poses: (T, 24) - all joint poses
-    # reference_poses: (T, 24) - reference poses
-    # fixed_joints_mask: (T, 8) - which joints were fixed in which frames
-    
-    if fixed_joints_mask.sum() == 0:
-        return torch.tensor(0.0, device=poses.device)
-    
-    # Reshape poses to (T, num_joints, 3) for easier processing
-    poses_reshaped = poses.view(poses.shape[0], 8, 3)
-    ref_poses_reshaped = reference_poses.view(reference_poses.shape[0], 8, 3)
-    
-    # Compute loss only for fixed joint-frame combinations
-    total_loss = 0.0
-    count = 0
-    
-    # Only iterate over frames and joints that were actually fixed
-    fixed_indices = torch.where(fixed_joints_mask)
-    for t, joint_idx in zip(fixed_indices[0], fixed_indices[1]):
-        diff = poses_reshaped[t, joint_idx] - ref_poses_reshaped[t, joint_idx]
-        total_loss += torch.norm(diff)
-        count += 1
-    
-    if count == 0:
-        return torch.tensor(0.0, device=poses.device)
-    
-    return weight * (total_loss / count)
-
-
-def compute_temporal_smoothing_loss_fixed_frames_only(poses, fixed_joints_mask, joint_optimization_mask, weight_accel=0.5, weight_vel=0.25):
-    """Compute temporal smoothing loss ONLY between fixed frames and their neighbors for continuity.
-    
-    This function computes smoothness between:
-    1. Fixed frames and their immediate neighbors (for smooth transitions)
-    2. Between consecutive fixed frames (for internal smoothness)
-    
-    Example: If frames [34, 67] and [122, 150] are fixed, we compute:
-    - Velocity loss: (pose[34] - pose[33]), (pose[35] - pose[34]), ..., (pose[67] - pose[66]), (pose[68] - pose[67])
-    - Velocity loss: (pose[122] - pose[121]), (pose[123] - pose[122]), ..., (pose[150] - pose[149]), (pose[151] - pose[150])
-    - Similar pattern for acceleration losses
-    
-    This ensures smooth transitions between fixed and non-fixed regions.
+    Temporal smoothing on HAND JOINT 3D positions (no FK inside).
+    Only frames near fixed frames get gradients (fixed frames +/- neighbor_radius).
     """
-    # poses: (T, 24) - all joint poses
-    # fixed_joints_mask: (T, 8) - which joints were fixed in which frames
+    assert torch.is_tensor(joints) and joints.ndim == 3 and joints.size(-1) == 3, "joints must be (T,J,3)"
+    dev = joints.device
+    dtype = joints.dtype
+    T, J, _ = joints.shape
 
-    # Use global debug flag for printing smoothness information
-    global flag
+    # ---- default hand joint set (wrists + fingertip chains used earlier) ----
+    if hand_joint_ids is None:
+        # wrists (20,21) + left fingertips bases (25,28,31,34,37) + right (40,43,46,49,52)
+        hand_joint_ids = [20, 21, 25, 28, 31, 34, 37, 40, 43, 46, 49, 52]
+    Jsel = torch.as_tensor(hand_joint_ids, device=dev, dtype=torch.long)
 
-    T, num_joints_total = poses.shape
-    num_joints = fixed_joints_mask.shape[1]  # Should be 8
-    
-    if fixed_joints_mask.sum() < 2:
-        return torch.tensor(0.0, device=poses.device)
-    
-    # For each joint, compute temporal smoothing between fixed frames and their neighbors
-    # BUT only for joints that were fixed in previous steps
-    loss = torch.tensor(0.0, device=poses.device)
-    for joint_idx in range(num_joints):
-        # Skip joints that were not fixed in any frame
-        if not joint_optimization_mask[joint_idx]:
-            continue
-            
-        # Get frames where this joint was fixed
-        fixed_frames_for_joint = torch.where(fixed_joints_mask[:, joint_idx])[0]
-        
-        # Create a mask for frames that should contribute to smoothness:
-        # 1. Fixed frames themselves
-        # 2. Neighbors of fixed frames (for smooth transitions)
-        smoothness_mask = torch.zeros(T, dtype=torch.bool, device=poses.device)
-        
-        for frame_idx in fixed_frames_for_joint:
-            # Mark the fixed frame
-            smoothness_mask[frame_idx] = True
-            if frame_idx > 0:
-                smoothness_mask[frame_idx - 1] = True
-            if frame_idx < T - 1:
-                smoothness_mask[frame_idx + 1] = True
-        
-        if flag:
-            print("smoothness mask at frames", torch.where(smoothness_mask)[0])
-            # print("velocity calculated at frames", torch.where(vel_calc_mask)[0])
-            flag = False
-        joint_poses = poses[:, joint_idx * 3:joint_idx * 3 + 3]
-        selective_poses = joint_poses * smoothness_mask.float().unsqueeze(1) + joint_poses.detach() * (~smoothness_mask).float().unsqueeze(1)
-        
-        # Compute velocity loss (first differences)
-        vel_loss = torch.sum((selective_poses[1:] - selective_poses[:-1]) ** 2)
-        # Compute acceleration loss (second differences) - only if we have at least 3 frames
-        if T >= 3:
-            accel_loss = torch.sum(((selective_poses[2:] - selective_poses[1:-1]) - (selective_poses[1:-1] - selective_poses[:-2])) ** 2)
-        else:
-            accel_loss = torch.tensor(0.0, device=poses.device)
-        
-        # Add to total loss
-        loss += weight_vel * vel_loss + weight_accel * accel_loss        
- 
+    # ---- frame mask (which frames get smoothed) ----
+    if fixed_joints_mask is None or joint_optimization_mask is None:
+        frame_mask = torch.ones(T, dtype=torch.bool, device=dev)
+    else:
+        if not torch.is_tensor(fixed_joints_mask):
+            fixed_joints_mask = torch.as_tensor(fixed_joints_mask, dtype=torch.bool, device=dev)
+        if not torch.is_tensor(joint_optimization_mask):
+            joint_optimization_mask = torch.as_tensor(joint_optimization_mask, dtype=torch.bool, device=dev)
+
+        # frames where any optimized joint was fixed
+        active = fixed_joints_mask[:, joint_optimization_mask]   # (T, N_active)
+        frame_mask = active.any(dim=1)                           # (T,)
+
+        # dilate by neighbor_radius (include neighbors)
+        if neighbor_radius > 0 and frame_mask.any():
+            idx = torch.where(frame_mask)[0]
+            fm = frame_mask.clone()
+            for d in range(1, neighbor_radius + 1):
+                left  = (idx - d).clamp_min(0)
+                right = (idx + d).clamp_max(T - 1)
+                fm[left]  = True
+                fm[right] = True
+            frame_mask = fm
+
+    # ---- select hand joints, optionally make root-relative ----
+    P = joints[:, Jsel, :]  # (T, K, 3)
+    if use_root_relative:
+        root = joints[:, root_joint_index, :].unsqueeze(1)  # (T,1,3)
+        P = P - root
+
+    # per-joint weights (K,)
+    if per_joint_weights is not None:
+        wj = torch.as_tensor(per_joint_weights, device=dev, dtype=dtype).view(1, -1, 1)  # (1,K,1)
+    else:
+        wj = None
+
+    # gate gradients to masked frames only
+    mask3 = frame_mask.view(T, 1, 1)
+    P_sel = P * mask3 + P.detach() * (~mask3)
+
+    loss = torch.zeros((), device=dev, dtype=dtype)
+
+    # velocity term
+    if T >= 2 and weight_vel != 0.0:
+        V = P_sel[1:] - P_sel[:-1]   # (T-1, K, 3)
+        if wj is not None:
+            V = V * wj
+        loss_vel = (V * V).mean()
+        loss = loss + weight_vel * loss_vel
+
+    # acceleration term
+    if T >= 3 and weight_accel != 0.0:
+        A = P_sel[2:] - 2 * P_sel[1:-1] + P_sel[:-2]  # (T-2, K, 3)
+        if wj is not None:
+            A = A * wj
+        loss_acc = (A * A).mean()
+        loss = loss + weight_accel * loss_acc
+
     return loss
-
-def compute_reference_loss_selective(poses, reference_poses, fixed_joints_mask, weight=1.0):
-    """Compute reference loss only for fixed joint-frame combinations.
-    
-    This function efficiently computes the difference between optimized poses and reference poses,
-    but only for the specific joint-frame combinations that were influenced by previous steps.
-    """
-    # poses: (T, 24) - all joint poses
-    # reference_poses: (T, 24) - reference poses
-    # fixed_joints_mask: (T, 8) - which joints were fixed in which frames
-    
-    if fixed_joints_mask.sum() == 0:
-        return torch.tensor(0.0, device=poses.device)
-    
-    # Reshape poses to (T, num_joints, 3) for easier processing
-    poses_reshaped = poses.view(poses.shape[0], 8, 3)
-    ref_poses_reshaped = reference_poses.view(reference_poses.shape[0], 8, 3)
-    
-    # Compute loss only for fixed joint-frame combinations
-    total_loss = 0.0
-    count = 0
-    
-    # Only iterate over frames and joints that were actually fixed
-    fixed_indices = torch.where(fixed_joints_mask)
-    for t, joint_idx in zip(fixed_indices[0], fixed_indices[1]):
-        diff = poses_reshaped[t, joint_idx] - ref_poses_reshaped[t, joint_idx]
-        total_loss += torch.norm(diff)
-        count += 1
-    
-    if count == 0:
-        return torch.tensor(0.0, device=poses.device)
-    
-    return weight * (total_loss / count)
 
 
 def compute_palm_loss_selective(
@@ -1201,11 +885,11 @@ def compute_palm_loss_selective(
 
     # --- pick hand joint indices ---
     if is_left_hand:
-        IDX_WRIST, IDX_INDEX, IDX_PINKY = 20, 25, 31
+        IDX_WRIST, IDX_INDEX, IDX_PINKY = 20, 27, 33
         wrist_col = 6
         flip_normal = True
     else:
-        IDX_WRIST, IDX_INDEX, IDX_PINKY = 21, 40, 46
+        IDX_WRIST, IDX_INDEX, IDX_PINKY = 21, 42, 48
         wrist_col = 7
         flip_normal = False
 
@@ -1265,94 +949,6 @@ def compute_palm_loss_selective(
     else:
         return torch.zeros((), device=device, dtype=joints.dtype)
 
-def compute_palm_facing_loss_selective(joints, verts_obj_transformed, contact_mask, fixed_joints_mask, is_left_hand=True, joint_optimization_mask=None):
-    """
-    Compute palm facing loss: encourage palm normal to align with direction to object.
-    Only applies loss when hand is in contact with object.
-    
-    Args:
-        joints: Joint positions (T, J, 3)
-        verts_obj_transformed: Object vertices (T, M, 3)
-        contact_mask: Boolean mask (T,) indicating when hand is in contact
-        fixed_joints_mask: (T, 8) boolean mask indicating which joint-frame combinations were fixed
-        is_left_hand: Whether computing for left or right hand
-    
-    Returns:
-        facing_loss: Loss encouraging palm to face the object (during contact)
-    """
-    # Define palm joint indices
-    if is_left_hand:
-        IDX_WRIST = 20
-        IDX_INDEX = 25  # Left index MCP
-        IDX_PINKY = 31  # Left pinky MCP
-        flip_normal = True
-    else:
-        IDX_WRIST = 21
-        IDX_INDEX = 40  # Right index MCP
-        IDX_PINKY = 46  # Right pinky MCP
-        flip_normal = False
-    
-    # Extract palm joints
-    wrist_joints = joints[:, IDX_WRIST, :]  # (T, 3)
-    index_joints = joints[:, IDX_INDEX, :]  # (T, 3)
-    pinky_joints = joints[:, IDX_PINKY, :]  # (T, 3)
-    
-    # Compute palm normal
-    v1 = index_joints - wrist_joints  # (T, 3)
-    v2 = pinky_joints - wrist_joints  # (T, 3)
-    palm_normals = torch.cross(v1, v2, dim=1)  # (T, 3)
-    if flip_normal:
-        palm_normals = -palm_normals
-    palm_normals = palm_normals / (palm_normals.norm(dim=1, keepdim=True) + 1e-8)
-        
-    # Compute palm centroid
-    palm_centroid = (wrist_joints + index_joints + pinky_joints) / 3.0  # (T, 3)
-    
-    # Find nearest object point to palm centroid
-    rel_to_centroid = verts_obj_transformed - palm_centroid.unsqueeze(1)  # (T, N, 3)
-    dists_to_centroid = rel_to_centroid.norm(dim=2)  # (T, N)
-    min_dists, min_idx = dists_to_centroid.min(dim=1)  # (T,), (T,)
-    
-    # Use gather to maintain gradients
-    batch_indices = torch.arange(verts_obj_transformed.shape[0], device=verts_obj_transformed.device)
-    nearest_points = verts_obj_transformed[batch_indices, min_idx, :]  # (T, 3)
-    
-    # FACING LOSS: encourage palm normal to align with direction to object
-    # This means palm_normal · direction_to_object ≈ 1
-    direction_to_object = nearest_points - palm_centroid
-    direction_to_object = direction_to_object / (direction_to_object.norm(dim=1, keepdim=True) + 1e-8)
-    facing_dot_product = (palm_normals * direction_to_object).sum(dim=1)
-    
-    # Simple and direct: penalize deviation from perfect alignment
-    # For 0° angle: cos(0°) = 1, loss = 0
-    # For 90° angle: cos(90°) = 0, loss = 1  
-    # For 130° angle: cos(130°) ≈ -0.64, loss = 1.64
-    facing_loss_per_frame = 1.0 - facing_dot_product
-    
-    # Only apply loss when hand is in contact with object AND when the relevant joints were optimized
-    if contact_mask.sum() == 0:
-        return torch.tensor(0.0, device=joints.device)
-    combined_mask = contact_mask
-
-    # Check if the relevant joints (wrist, index, pinky) were optimized
-    if is_left_hand:
-        # Left hand joints: wrist (6), index (25), pinky (31) -> check if wrist was optimized
-        combined_mask = contact_mask & fixed_joints_mask[:, 6]
-        # combined_mask = contact_mask
-        # print(f"left hand facing loss largest {torch.max(facing_loss_per_frame[combined_mask])} at frame {torch.argmax(facing_loss_per_frame[combined_mask])}")
-    else:
-        # Right hand joints: wrist (7), index (40), pinky (46) -> check if wrist was optimized  
-        combined_mask = contact_mask & fixed_joints_mask[:, 7]
-        # combined_mask = contact_mask
-    
-    
-    facing_loss = torch.mean(torch.where(
-        combined_mask,
-        facing_loss_per_frame,  # Apply loss during contact
-        torch.zeros_like(facing_loss_per_frame)  # No loss otherwise
-    ))
-    
-    return facing_loss
 
 def compute_finger_distance_loss_with_mask(joints, verts_obj_transformed, contact_mask, frame_mask, is_left_hand=True):
     """
@@ -1423,75 +1019,6 @@ def compute_finger_distance_loss_with_mask(joints, verts_obj_transformed, contac
     return distance_loss + total_distance_penalty
 
 
-def hand_joint_regulation_epoch(
-    object_verts: torch.Tensor,        # (T, Nobj, 3), static over epochs
-    prev_anchor_verts: torch.Tensor,   # (T, 5, 3), anchors from prev epoch (use as EMA seed)
-    prev_anchor_dists: torch.Tensor,   # (T, 5),    dists from prev epoch (use as EMA seed)
-    joints_curr: torch.Tensor,         # (T, 5, 3), current-epoch fingertip joints (one hand)
-    close_mask: torch.Tensor,          # (T,) bool
-    fixed_joints_mask: torch.Tensor,   # (T, 8) bool
-    epoch: int,
-    ema_alpha: float = 1.0,            # higher = smoother EMA target
-):
-    """
-    EMA regulation:
-      1) Find current anchors (nearest object verts to current joints).
-      2) Update EMA anchors/distances:
-            ema_next = alpha * prev + (1-alpha) * current
-      3) Loss (masked frames): mean_{t,j} ( ||j_curr - ema_anchor|| - ema_dist )^2
-         (EMA reference is detached; gradients flow only to joints_curr.)
-      4) Return loss and (ema_anchor_verts_next, ema_anchor_dists_next) for next epoch.
-
-    Returns:
-      loss: scalar tensor
-      ema_anchor_verts_next: (T, 5, 3)
-      ema_anchor_dists_next: (T, 5)
-    """
-    device = joints_curr.device
-    dtype  = joints_curr.dtype
-    T, Nobj, _ = object_verts.shape
-
-    # --- 1) Current anchors (argmin) for this epoch (non-differentiable bookkeeping) ---
-    with torch.no_grad():
-        # (T, 5, Nobj)
-        dmat = torch.cdist(joints_curr.detach(), object_verts)
-        idx  = dmat.argmin(dim=2)  # (T, 5)
-        curr_anchor_verts = torch.gather(
-            object_verts, dim=1, index=idx.unsqueeze(-1).expand(T, 5, 3)
-        )  # (T, 5, 3)
-        curr_anchor_dists = torch.norm(
-            joints_curr.detach() - curr_anchor_verts, dim=2
-        )  # (T, 5)
-
-    # --- 2) EMA update (initialize at epoch 0 with current anchors if needed) ---
-    if epoch == 0 or prev_anchor_verts is None or prev_anchor_dists is None:
-        ema_anchor_verts_next = curr_anchor_verts
-        ema_anchor_dists_next = curr_anchor_dists
-        # No regulation on epoch 0, but return initialized EMA for next epoch
-        return torch.zeros((), device=device, dtype=dtype), ema_anchor_verts_next, ema_anchor_dists_next
-
-    with torch.no_grad():
-        ema_anchor_verts_next = ema_alpha * prev_anchor_verts + (1.0 - ema_alpha) * curr_anchor_verts
-        ema_anchor_dists_next = ema_alpha * prev_anchor_dists + (1.0 - ema_alpha) * curr_anchor_dists
-
-    # --- 3) Loss against EMA reference (masking by close & fixed for this hand) ---
-    frame_mask = close_mask & fixed_joints_mask
-    if not torch.any(frame_mask):
-        return torch.zeros((), device=device, dtype=dtype), ema_anchor_verts_next, ema_anchor_dists_next
-
-    idx_t = torch.nonzero(frame_mask, as_tuple=False).squeeze(-1)  # (B,)
-    joints_B   = joints_curr.index_select(0, idx_t)                       # (B, 5, 3)
-    ema_vertsB = ema_anchor_verts_next.index_select(0, idx_t)             # (B, 5, 3)
-    ema_distsB = ema_anchor_dists_next.index_select(0, idx_t)             # (B, 5)
-
-    d_curr = torch.norm(joints_B - ema_vertsB.detach(), dim=2)            # (B, 5)
-    d_ref  = ema_distsB.detach()                                          # (B, 5)
-
-    loss = ((d_curr - d_ref) ** 2).mean()  # mean over joints and frames
-
-    # --- 4) Return loss and updated EMA for next epoch ---
-    return loss, ema_anchor_verts_next, ema_anchor_dists_next
-
 def precompute_hand_object_distances(verts, verts_obj_transformed, obj_normals, rhand_idx, lhand_idx):
     """
     Pre-compute hand-object distances for the original sequence to create distance masks.
@@ -1544,9 +1071,9 @@ def precompute_hand_object_distances(verts, verts_obj_transformed, obj_normals, 
     right_optimize_mask = (right_hand_min_dist <= close_thresh) & (right_hand_min_dist >= correction_thresh)
     left_optimize_mask = (left_hand_min_dist <= close_thresh) & (left_hand_min_dist >= correction_thresh)
     
-    print(f"Distance pre-computation results:")
-    print(f"  Right hand: {right_contact_mask.sum().item()}/{T} contact frames, {right_close_mask.sum().item()}/{T} close frames")
-    print(f"  Left hand: {left_contact_mask.sum().item()}/{T} contact frames, {left_close_mask.sum().item()}/{T} close frames")
+    # print(f"Distance pre-computation results:")
+    # print(f"  Right hand: {right_contact_mask.sum().item()}/{T} contact frames, {right_pen_mask.sum().item()}/{T} pen frames")
+    # print(f"  Left hand: {left_contact_mask.sum().item()}/{T} contact frames, {left_pen_mask.sum().item()}/{T} pen frames")
     
     return {
         'right_pen_mask': right_pen_mask,
@@ -1600,7 +1127,7 @@ def compute_hand_penetration_loss(
     pen_left = _compute_single_hand_penetration(
         verts_left[:, lhand_idx, :],
         verts_obj_transformed, obj_normals, fixed_joints_mask[:, 6],
-        thresh=thresh, epoch=epoch
+        thresh=thresh, epoch=-1
     )
 
     # --- Right hand ---
@@ -1644,25 +1171,26 @@ def _compute_single_hand_penetration(
     max_depths = depths.max(dim=-1).values              # (T,) deepest penetration per frame
 
     # Frame mask: only keep frames with penetration, fixed joint, and not too deep
-    frame_mask = (counts > 0) & hand_fixed_mask & (max_depths <= 0.1)
+
+    frame_mask = (counts > 0) & hand_fixed_mask & (0.01 <= max_depths) & (max_depths <= 0.1)
 
     if frame_mask.any():
         depth_sum = (depths * pen_mask).sum(dim=-1)     # (T,) sum of depths for each frame
         per_frame = depth_sum                           # loss contribution per frame
 
         # ---- Debug prints ----
-        if epoch == 0 or epoch == 299:
+        if epoch % 50 == 0:
             frame_ids = frame_mask.nonzero(as_tuple=True)[0]
             for f in frame_ids:
                 num_pene = counts[f].item()
                 if num_pene > 0:
                     max_depth = depths[f].max().item()
                     frame_loss = per_frame[f].item()
-                    print(f"[Penetration DEBUG] Frame {f.item():04d}: "
-                          f"minimum sbj2obj={sbj2obj[f].min().item():.6f}, "
-                          f"{num_pene} verts penetrating, "
-                          f"deepest={max_depth:.6f}, "
-                          f"loss={frame_loss:.6f}")
+                    # print(f"[Penetration DEBUG] Frame {f.item():04d}: "
+                    #       f"minimum sbj2obj={sbj2obj[f].min().item():.6f}, "
+                    #       f"{num_pene} verts penetrating, "
+                    #       f"deepest={max_depth:.6f}, "
+                    #       f"loss={frame_loss:.6f}")
 
         total_penetration_loss = per_frame[frame_mask].sum()
         return total_penetration_loss / T
@@ -1674,8 +1202,8 @@ def _compute_single_hand_penetration(
 
 
 def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_transformed, obj_normals,
-                                     fix_tracker, distance_info, rhand_idx, lhand_idx, 
-                                     num_epochs=500, lr=0.01, canonical_joints=None):
+                                     fix_tracker, distance_info, rhand_idx, lhand_idx, rhand_anchor_idx=None, lhand_anchor_idx=None,
+                                     num_epochs=500, lr=0.01, canonical_joints=None, targets=None):
     """Two-stage optimization: Stage 1 optimizes only wrist poses, Stage 2 optimizes all joints.
     
     Stage 1: Only optimize wrist poses (left and right) to fix palm orientation
@@ -1715,6 +1243,8 @@ def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_tr
         # Mark joints that were fixed in any frame
         if fixed_joints_mask[:, joint_idx].any():  # If any frame was fixed for this joint
             joint_optimization_mask[joint_idx] = True  # Mark this joint for optimization
+    selected_joints = torch.nonzero(joint_optimization_mask, as_tuple=False).flatten().tolist()
+    
     # Print out for each joint which frames are fixed according to fixed_joints_mask
     joint_names = [
         "left_collar", "right_collar", "left_shoulder", "right_shoulder",
@@ -1722,7 +1252,7 @@ def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_tr
     ]
     for joint_idx in range(8):
         fixed_frames = torch.where(fixed_joints_mask[:, joint_idx])[0].cpu().numpy().tolist()
-        print(f"Joint {joint_idx} ({joint_names[joint_idx]}): fixed at frames {fixed_frames}")
+        # print(f"Joint {joint_idx} ({joint_names[joint_idx]}): fixed at frames {fixed_frames}")
     # Create optimization mask for all poses: ALL frames for fixed joints
     optimization_mask = torch.zeros_like(all_joint_poses_tensor, dtype=torch.bool)
     for joint_idx in range(8):  # 8 joints
@@ -1732,57 +1262,56 @@ def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_tr
         if joint_optimization_mask[joint_idx]:
             optimization_mask[:, pose_start:pose_end] = True  # Mark all frames for this joint
     
+    JOINT_156_SLICES = [(39,42),(42,45),(48,51),(51,54),(54,57),(57,60),(60,63),(63,66)]  # length 8
+
     # Early stopping setup
     best_loss = float('inf')
     best_poses = None
     patience_counter = 0
-    patience = 400
+    patience = 200
     left_finger_mask = distance_info['left_close_mask'] & fixed_joints_mask[:, 6]
     right_finger_mask = distance_info['right_close_mask'] & fixed_joints_mask[:, 7]
-    # left_finger_mask = distance_info['left_close_mask']
-    # right_finger_mask = distance_info['right_close_mask']
-    left_wrist_fixed_mask = torch.where(left_finger_mask)[0]
-    right_wrist_fixed_mask = torch.where(right_finger_mask)[0]
 
-    # Convert to unique frame indices (since each frame has 778 hand vertices)
-    left_fixed_unique_frames = sorted(list(set(left_wrist_fixed_mask)))
-    right_fixed_unique_frames = sorted(list(set(right_wrist_fixed_mask)))
-
+    left_not_close_mask = ~distance_info['left_close_mask']  # (T,)
+    right_not_close_mask = ~distance_info['right_close_mask']  # (T,)
+    left_forearm_axis = canonical_joints[LEFT_WRIST] - canonical_joints[LEFT_ELBOW]  # (3,)
+    right_forearm_axis = canonical_joints[RIGHT_WRIST] - canonical_joints[RIGHT_ELBOW]  # (3,)
     
+    # Convert to PyTorch tensors and move to device
+    left_forearm_axis = torch.from_numpy(left_forearm_axis).float().to(device)
+    right_forearm_axis = torch.from_numpy(right_forearm_axis).float().to(device)
+    
+    # Normalize bone axes
+    left_forearm_axis = left_forearm_axis / torch.norm(left_forearm_axis)
+    right_forearm_axis = right_forearm_axis / torch.norm(right_forearm_axis)
+
     # ==================== STAGE 1: Optimize only wrist poses ====================
-    print("\n=== STAGE 1: Optimizing only wrist poses ===")
-    
-    # Create wrist-only optimizer (only wrist poses)
-    # We need to create a separate tensor for wrist poses to make it a leaf tensor
-    wrist_poses_tensor = torch.cat([
-        all_joint_poses_tensor[:, 18:21].detach(),  # Left wrist (indices 18:21)
-        all_joint_poses_tensor[:, 21:24].detach(),  # Right wrist (indices 21:24)
-    ], dim=1).clone().requires_grad_(True)  # Shape: (T, 6) - left wrist (3) + right wrist (3)
-    
-    wrist_optimizer = torch.optim.Adam([wrist_poses_tensor], lr=0.001)
-    wrist_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(wrist_optimizer, mode='min', factor=0.7, patience=300, verbose=True)
-    
+    # print("\n=== STAGE 1: Optimizing only wrist poses ===")
+    sel_blocks = [slice(j*3, j*3+3) for j in selected_joints]
+    sel_init = torch.cat([all_joint_poses_tensor[:, blk] for blk in sel_blocks], dim=1).detach().clone().to(device)
+    sel_params = sel_init.clone().requires_grad_(True)  # (T, 3*K)
+
+    sel_ref = torch.cat([reference_all_joint_poses[:, blk] for blk in sel_blocks], dim=1)
+
+    wrist_optimizer = torch.optim.Adam([sel_params], lr=0.001)
+    wrist_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(wrist_optimizer, mode='min', factor=0.7, patience=150, verbose=True)
+
     # Stage 1 optimization loop
-    stage1_epochs = 300  # Use half of total epochs for stage 1
+    stage1_epochs = num_epochs  # Use half of total epochs for stage 1
     best_wrist_loss = float('inf')
     best_wrist_poses = None
     T = poses.shape[0]
-    prev_anchor_verts_r = torch.zeros(T, 5, 3).to(device)
-    prev_anchor_dists_r = torch.zeros(T, 5).to(device)
-    prev_anchor_verts_l = torch.zeros(T, 5, 3).to(device)
-    prev_anchor_dists_l = torch.zeros(T, 5).to(device)
-    reference_wrist_poses = reference_all_joint_poses[:, 18:24]  # Shape: (T, 6)
-    # print(distance_info['left_close_mask'])
+
     for epoch in range(stage1_epochs):
         wrist_optimizer.zero_grad()
         
         # Create poses tensor with only wrist poses updated
         poses_tensor = torch.from_numpy(poses).float().to(device)
-        
-        # Update only wrist poses in the full poses tensor
-        poses_tensor[:, 60:63] = wrist_poses_tensor[:, :3]      # Left wrist
-        poses_tensor[:, 63:66] = wrist_poses_tensor[:, 3:6]     # Right wrist
-        
+        offset = 0
+        for j in selected_joints:
+            start156, end156 = JOINT_156_SLICES[j]
+            poses_tensor[:, start156:end156] = sel_params[:, offset:offset+3]
+            offset += 3
         # Use SMPLX16 model
         model = sbj_m_all[gender]
         
@@ -1796,244 +1325,89 @@ def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_tr
         )
             
         joints = output.Jtr
-        if epoch == 0:
-            joints_epoch1 = joints.detach().clone()
-            joints_epoch2 = joints.clone()
+ 
+        if epoch < 200:
+            pen_left, pen_right = compute_hand_penetration_loss(
+                output.v, verts_obj_transformed, obj_normals, fixed_joints_mask,
+                lhand_idx, rhand_idx, detach_opposite=True, epoch=epoch
+            )
+            wrist_ref_loss = torch.mean((sel_params - sel_ref) ** 2)
+            left_palm_loss = compute_palm_loss_selective(
+                joints, verts_obj_transformed, obj_normals, distance_info['left_close_mask'], fixed_joints_mask, is_left_hand=True, joint_optimization_mask=joint_optimization_mask, epoch=epoch
+            )
+            right_palm_loss = compute_palm_loss_selective(
+                joints, verts_obj_transformed, obj_normals, distance_info['right_close_mask'], fixed_joints_mask, is_left_hand=False, joint_optimization_mask=joint_optimization_mask, epoch=epoch
+            )
+            palm_loss = left_palm_loss + right_palm_loss
+
+            finger_loss = compute_finger_distance_loss_with_mask(
+                joints, verts_obj_transformed, distance_info['left_close_mask'], left_finger_mask, is_left_hand=True
+            ) + compute_finger_distance_loss_with_mask(
+                joints, verts_obj_transformed, distance_info['right_close_mask'], right_finger_mask, is_left_hand=False
+            )
         else:
-            joints_epoch2 = joints.clone()
-        
-        # Compute bone axes for left and right forearm (elbow to wrist direction)
-        left_forearm_axis = canonical_joints[LEFT_WRIST] - canonical_joints[LEFT_ELBOW]  # (3,)
-        right_forearm_axis = canonical_joints[RIGHT_WRIST] - canonical_joints[RIGHT_ELBOW]  # (3,)
-        
-        # Convert to PyTorch tensors and move to device
-        left_forearm_axis = torch.from_numpy(left_forearm_axis).float().to(device)
-        right_forearm_axis = torch.from_numpy(right_forearm_axis).float().to(device)
-        
-        # Normalize bone axes
-        left_forearm_axis = left_forearm_axis / torch.norm(left_forearm_axis)
-        right_forearm_axis = right_forearm_axis / torch.norm(right_forearm_axis)
-        
-        # Extract initial twist angles from Stage 2 wrist poses
-        # Calculate proper twist angles: normalize pose, get cosine with bone axis, multiply by pose magnitude
-        left_wrist_poses = wrist_poses_tensor[:, :3]  # (T, 3)
-        right_wrist_poses = wrist_poses_tensor[:, 3:6]  # (T, 3)
-        
-        # Left hand twist calculation
-        left_pose_magnitudes = torch.norm(left_wrist_poses, dim=1, keepdim=True)  # (T, 1)
-        left_pose_axes = left_wrist_poses / (left_pose_magnitudes + 1e-8)  # (T, 3) - normalized rotation axes
-        left_cosines = torch.sum(left_pose_axes * left_forearm_axis.unsqueeze(0), dim=1)  # (T,) - cosine between axes
-        left_twist_rad = left_pose_magnitudes.squeeze(1) * left_cosines  # (T,) - twist angle = magnitude * cosine
-        
-        # Right hand twist calculation  
-        right_pose_magnitudes = torch.norm(right_wrist_poses, dim=1, keepdim=True)  # (T, 1)
-        right_pose_axes = right_wrist_poses / (right_pose_magnitudes + 1e-8)  # (T, 3) - normalized rotation axes
-        right_cosines = torch.sum(right_pose_axes * right_forearm_axis.unsqueeze(0), dim=1)  # (T,) - cosine between axes
-        right_twist_rad = right_pose_magnitudes.squeeze(1) * right_cosines  # (T,) - twist angle = magnitude * cosine
+            pen_left, pen_right = torch.tensor(0.0), torch.tensor(0.0)
+            wrist_ref_loss = torch.tensor(0.0)
+            finger_loss = torch.tensor(0.0)
+            palm_loss = torch.tensor(0.0)
 
-        # Create masks for frames where hands are NOT close to object
-        left_not_close_mask = ~distance_info['left_close_mask']  # (T,)
-        right_not_close_mask = ~distance_info['right_close_mask']  # (T,)
-        
-        # Compute loss: encourage twist to be close to 0 radians when not close to object
-        # Use MSE loss: (twist_angle - 0)^2 = twist_angle^2
-        left_spare_twist_loss = torch.mean(left_twist_rad[left_not_close_mask] ** 2) if left_not_close_mask.any() else torch.tensor(0.0, device=device)
-        right_spare_twist_loss = torch.mean(right_twist_rad[right_not_close_mask] ** 2) if right_not_close_mask.any() else torch.tensor(0.0, device=device)
-        
-        spare_hand_twist_loss = left_spare_twist_loss + right_spare_twist_loss 
-        # Only compute palm orientation loss in Stage 1
-
-        left_palm_loss = compute_palm_loss_selective(
-            joints, verts_obj_transformed, obj_normals, distance_info['left_close_mask'], fixed_joints_mask, is_left_hand=True, joint_optimization_mask=joint_optimization_mask, epoch=epoch
+        hand_smooth_loss = compute_joints_smoothing_loss(
+            joints=joints,                      # (T,J,3) from your model forward
+            fixed_joints_mask=fixed_joints_mask,     # (T,8) bool
+            joint_optimization_mask=joint_optimization_mask,  # (8,) bool
+            hand_joint_ids=[20,21,25,28,31,34,37,40,43,46,49,52],
+            neighbor_radius=1,
+            use_root_relative=True,
+            root_joint_index=0,
+            per_joint_weights=None,                  # or e.g. wrist-heavy weights
+            weight_vel=0.25,
+            weight_accel=0.5,
         )
-        right_palm_loss = compute_palm_loss_selective(
-            joints, verts_obj_transformed, obj_normals, distance_info['right_close_mask'], fixed_joints_mask, is_left_hand=False, joint_optimization_mask=joint_optimization_mask, epoch=epoch
-        )
-        palm_loss = left_palm_loss + right_palm_loss
-        left_finger_loss = compute_finger_distance_loss_with_mask(
-            joints, verts_obj_transformed, distance_info['left_close_mask'], left_finger_mask, is_left_hand=True
-        )
-        right_finger_loss = compute_finger_distance_loss_with_mask(
-            joints, verts_obj_transformed, distance_info['right_close_mask'], right_finger_mask, is_left_hand=False
-        )
-        finger_loss = left_finger_loss + right_finger_loss
-        # Simple reference loss for wrist poses only
-        # Extract wrist poses from reference (indices 18:24 correspond to left and right wrist)
-        wrist_ref_loss = torch.mean((wrist_poses_tensor - reference_wrist_poses) ** 2)
-
-        left_regulation = torch.tensor(0.0)
-        right_regulation = torch.tensor(0.0)
-        left_regulation, curr_anchor_verts_l, curr_anchor_dists_l = hand_joint_regulation_epoch(
-            verts_obj_transformed,           # Constant object vertices
-            prev_anchor_verts_l,
-            prev_anchor_dists_l,
-            joints[:, [25, 28, 31, 34, 37]],
-            distance_info['left_close_mask'],
-            fixed_joints_mask[:, 6],
-            epoch
-        )
-
-            # For right hand regulation
-        right_regulation, curr_anchor_verts_r, curr_anchor_dists_r = hand_joint_regulation_epoch(
-            verts_obj_transformed,
-            prev_anchor_verts_r,
-            prev_anchor_dists_r,
-            joints[:, [40, 43, 46, 49, 52]],
-            distance_info['right_close_mask'],
-            fixed_joints_mask[:, 7],
-            epoch
-        )
-        pen_left, pen_right = compute_hand_penetration_loss(
-            output.v, verts_obj_transformed, obj_normals, fixed_joints_mask,
-            lhand_idx, rhand_idx, detach_opposite=True, epoch=epoch
-        )
-        # pen_left, pen_right = torch.tensor(0.0), torch.tensor(0.0)
         # Total loss for Stage 1
-        total_wrist_loss = 0.2 * pen_left + 0.2 * pen_right + 10 * wrist_ref_loss + palm_loss + 10 * left_regulation + 10 * right_regulation
-        # + 2 * palm_loss + 2 * finger_loss + left_regulation + right_regulation
-        # 
-        # + 0.2 * spare_hand_twist_loss + 10 * wrist_ref_loss
+        total_wrist_loss = 10 * hand_smooth_loss + 0.1 * pen_left + 0.1 * pen_right+ 10 * wrist_ref_loss + 0.5 * finger_loss
 
         # Check for improvement
         if total_wrist_loss < best_wrist_loss - 1e-6:
-            best_wrist_loss = total_wrist_loss
-            best_wrist_poses = wrist_poses_tensor.detach().clone()
+            best_wrist_loss = total_wrist_loss.detach()
+            best_sel_params = sel_params.detach().clone()
             patience_counter = 0
         else:
             patience_counter += 1
-        
-        # Early stopping
-        if patience_counter >= patience // 2:
+
+        if patience_counter >= patience:
             print(f"Stage 1 early stopping at epoch {epoch}")
             break
-        
-        if epoch % 20 == 0:
-            print(f"Stage 1 Epoch {epoch}: palm={palm_loss.item():.6f}, finger={finger_loss.item():.6f}, pen_left={pen_left.item():.6f}, pen_right={pen_right.item():.6f}, left_regulation={left_regulation.item():.6f}, right_regulation={right_regulation.item():.6f}, total={total_wrist_loss.item():.6f}")
-        
+
+        # if epoch % 20 == 0:
+        #     print(f"Stage 1 Epoch {epoch}: , "
+        #           f"pen_left={pen_left.item():.6f}, pen_right={pen_right.item():.6f}, hand_smooth_loss={hand_smooth_loss.item():.6f}, total={total_wrist_loss.item():.6f}")
+
         total_wrist_loss.backward()
-        joints_epoch1 = joints.detach().clone()
-        torch.nn.utils.clip_grad_norm_([wrist_poses_tensor], max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_([sel_params], max_norm=1.0)
         wrist_optimizer.step()
         wrist_scheduler.step(total_wrist_loss)
-        prev_anchor_verts_r = curr_anchor_verts_r.detach().clone()
-        prev_anchor_dists_r = curr_anchor_dists_r.detach().clone()
-        prev_anchor_verts_l = curr_anchor_verts_l.detach().clone()
-        prev_anchor_dists_l = curr_anchor_dists_l.detach().clone()
         
     
     # Update all_joint_poses_tensor with optimized wrist poses
-    if best_wrist_poses is not None:
-        # Detach and update the wrist poses in all_joint_poses_tensor
-        with torch.no_grad():
-            all_joint_poses_tensor[:, 18:21] = best_wrist_poses[:, :3].detach()      # Left wrist
-            all_joint_poses_tensor[:, 21:24] = best_wrist_poses[:, 3:6].detach()     # Right wrist
-        print(f"Stage 1 completed with best wrist loss: {best_wrist_loss:.6f}")
+    if best_sel_params is None:
+        best_sel_params = sel_params.detach()
+        print("Stage 1 completed using final selected-joint params")
     else:
-        # If no best poses, update with final wrist poses
-        with torch.no_grad():
-            all_joint_poses_tensor[:, 18:21] = wrist_poses_tensor[:, :3].detach()      # Left wrist
-            all_joint_poses_tensor[:, 21:24] = wrist_poses_tensor[:, 3:6].detach()     # Right wrist
-        print("Stage 1 completed using final wrist poses")
-    reference_all_joint_poses = all_joint_poses_tensor.clone()
+        print(f"Stage 1 completed with best loss: {best_wrist_loss.item():.6f}")
 
-    # ==================== STAGE 2: Optimize all joints ====================
-    print("\n=== STAGE 2: Optimizing all joints ===")
-    
-    # Optimizer for all joint poses
-    optimizer = torch.optim.Adam([all_joint_poses_tensor], lr=0.001)  # Lower learning rate for stage 2
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=200, verbose=True)
-    
-    # Stage 2 optimization loop
-    stage2_epochs = 400
-    
-    for epoch in range(stage2_epochs):
-        optimizer.zero_grad()
-        
-        # Reconstruct full poses for SMPL computation
-        # Only update the fixed joint-frame combinations, preserve original poses for non-fixed ones
-        poses_reconstructed = poses.copy()
-        
-        # Create a tensor that combines optimized poses (for fixed frames) and original poses (for non-fixed frames)
-        combined_poses = all_joint_poses_tensor.clone()
-        # For non-fixed frames, use the original reference poses
-        combined_poses[~optimization_mask] = reference_all_joint_poses[~optimization_mask]
-        
-        # Create poses tensor directly from combined_poses to maintain gradients
-        poses_tensor = torch.zeros((poses_reconstructed.shape[0], poses_reconstructed.shape[1]), 
-                                  dtype=torch.float32, device=device)
-        
-        # Copy original poses first
-        poses_tensor = torch.from_numpy(poses_reconstructed).float().to(device)
-        
-        # Then update with optimized poses (maintaining gradients for optimized parts)
-        poses_tensor[:, 39:42] = combined_poses[:, :3]      # Left collar
-        poses_tensor[:, 42:45] = combined_poses[:, 3:6]     # Right collar
-        poses_tensor[:, 48:51] = combined_poses[:, 6:9]     # Left shoulder
-        poses_tensor[:, 51:54] = combined_poses[:, 9:12]    # Right shoulder
-        poses_tensor[:, 54:57] = combined_poses[:, 12:15]  # Left elbow
-        poses_tensor[:, 57:60] = combined_poses[:, 15:18]  # Right elbow
-        poses_tensor[:, 60:63] = combined_poses[:, 18:21]  # Left wrist
-        poses_tensor[:, 63:66] = combined_poses[:, 21:24]  # Right wrist
-        frame_times = poses_reconstructed.shape[0]
-        
-        # Use SMPLX16 model (same as two_stage_wrist_optimize.py)
-        model = sbj_m_all[gender]
-        
-        # SMPLX16 format
-        output = model(
-            pose_body=poses_tensor[:, 3:66],
-            pose_hand=poses_tensor[:, 66:156],
-            betas=torch.from_numpy(betas[None, :]).repeat(frame_times, 1).float().to(device),
-            root_orient=poses_tensor[:, :3],
-            trans=torch.from_numpy(trans).float().to(device)
-        )
-        joints = output.Jtr
-        
-        # Compute smooth loss only between fixed frames and their neighbors (for continuity)
-        # Only for joints that were fixed in previous steps
-        smooth_loss = compute_temporal_smoothing_loss_fixed_frames_only(all_joint_poses_tensor, fixed_joints_mask, joint_optimization_mask)
-        
-        ref_loss = compute_reference_loss_selective(all_joint_poses_tensor, reference_all_joint_poses, fixed_joints_mask)
-        
-        penetration_loss = torch.tensor(0.0, device=all_joint_poses_tensor.device)
-        # Ensure all losses are tensors on the correct device
-        smooth_loss = smooth_loss.to(all_joint_poses_tensor.device)
-        # palm_loss = palm_loss.to(all_joint_poses_tensor.device)
-        penetration_loss = penetration_loss.to(all_joint_poses_tensor.device)
-        # finger_loss = finger_loss.to(all_joint_poses_tensor.device)
-        
-        # Combine all losses with appropriate weights for Stage 2
-        total_loss = 0.5 * smooth_loss + 2.0 * ref_loss
-        
-        # Check for improvement
-        if total_loss < best_loss - 1e-6:
-            best_loss = total_loss
-            best_poses = all_joint_poses_tensor.detach().clone()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"Stage 2 early stopping at epoch {epoch}")
-            break
-        
-        if epoch % 20 == 0:
-            print(f"Stage 2 Epoch {epoch}: smooth={smooth_loss.item():.6f}, ref={ref_loss.item():.6f},  penetration={penetration_loss.item():.6f}, total={total_loss.item():.6f}")
-        
-        total_loss.backward()
-        # if epoch % 100 == 0:
-        #     check_gradients_fn()
-        # Comprehensive analysis of frames 45-90
-        # analyze_gradients_fn(45, 90)
-        torch.nn.utils.clip_grad_norm_([all_joint_poses_tensor], max_norm=1.0)
-        optimizer.step()
-        scheduler.step(total_loss)
+    with torch.no_grad():
+        off = 0
+        for j in selected_joints:
+            all_joint_poses_tensor[:, j*3:(j+1)*3] = best_sel_params[:, off:off+3]
+            off += 3
+
+    # Refresh reference for Stage 2
+    reference_all_joint_poses = all_joint_poses_tensor.clone().detach()
     
     # Reconstruct final poses using best poses if available
     final_poses = poses.copy()
     poses_to_use = best_poses if best_poses is not None else all_joint_poses_tensor
-    print(f"Using {'best' if best_poses is not None else 'final'} poses with loss: {best_loss:.6f}")
+    # print(f"Using {'best' if best_poses is not None else 'final'} poses with loss: {best_loss:.6f}")
     
     # Create final combined poses: optimized for fixed frames, original for non-fixed frames
     final_combined_poses = poses_to_use.clone()
@@ -2048,7 +1422,7 @@ def optimize_poses_with_fixed_tracking(poses, betas, trans, gender, verts_obj_tr
     final_poses[:, 60:63] = final_combined_poses[:, 18:21].detach().cpu().numpy()  # Left wrist
     final_poses[:, 63:66] = final_combined_poses[:, 21:24].detach().cpu().numpy()  # Right wrist
     
-    print("Two-stage optimization completed successfully!")
+    # print("Two-stage optimization completed successfully!")
     return final_poses
 
 def restrict_angles(theta,theta_max,theta_min,mode,flag,alpha=0.01):
@@ -2092,7 +1466,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
     
     
     T=2
-    # comment: 这个T的作用是什么
     bs = T
     MASK2=list(range(T))    
     if T<1:
@@ -2115,10 +1488,8 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
     body_pose=torch.from_numpy(poses[:, 3:66]).float().to(device)
     betas_tensor=torch.from_numpy(betas[None, :]).repeat(frame_times, 1).float().to(device)
     trans_tensor=torch.from_numpy(trans).float().to(device)
-    # comment: 这个root对应的哪个部位的pose？应该是躯干？
     root_tensor=torch.from_numpy(poses[:, :3]).float().to(device)
     hand_pose_tensor=torch.from_numpy(poses[:, 66:156]).float().to(device)
-    # comment: HAND_MEAN_TITLE是behave没问题嘛？这些.npy文件是怎么来的？有对应手腕的吗
     rhand_mean=np.load(f'./exp/{HAND_MEAN_TITLE}_rhand_mean.npy')
     rhand_mean_torch=torch.from_numpy(rhand_mean.reshape(1,-1,3)).float().to(device).repeat(frame_times,1,1)
     lhand_mean=np.load(f'./exp/{HAND_MEAN_TITLE}_lhand_mean.npy')
@@ -2152,7 +1523,7 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
     
     min_distance_mean_hand=torch.min(h2o_signed_mean,dim=1)[0]
     MASK1=min_distance_mean_hand <= 0.02
-    # comment: 这一步在算什么
+
     thresh2=0.20
     k_l=1/(0.02-thresh2)
     b_l=thresh2/(thresh2-0.02)
@@ -2163,20 +1534,16 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
     WHETHER_TOUCH_RIGHT_L[MASK2] = 0
 
     MASK_MID=~MASK1 & ~MASK2
-    # comment: 这个参数代表什么min_distance_mean_hand[MASK_MID]*k_l+b_l
     WHETHER_TOUCH_RIGHT_L[MASK_MID]=min_distance_mean_hand[MASK_MID]*k_l+b_l
 
     WHETHER_TOUCH_RIGHT_L = WHETHER_TOUCH_RIGHT_L.float().detach().reshape(-1,1)
     WHETHER_TOUCH_RIGHT = MASK1.float().detach().reshape(-1,1)
-    # comment: 只有距离小于0.2时才optimize
     WHETHER_OPTIMIZE_RIGHT = (~MASK2).float().detach().reshape(-1,1)
     WHETHER_MIDTOUCH_RIGHT = (~MASK1).float().detach().reshape(-1,1)
 
     
     frame_times_right=torch.sum(WHETHER_TOUCH_RIGHT)
-    # comment: h2o signed mean shape (N, T)
     h2o_signed_mean = point2point_signed(verts_sbj_mean[:,lhand_idx],verts_obj)[1]
-    # comment: min_distance_mean_hand shape (N, )
     min_distance_mean_hand=torch.min(h2o_signed_mean,dim=1)[0]
     MASK1=min_distance_mean_hand<=0.02
     thresh2=0.20
@@ -2237,15 +1604,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
             o2h_signed, sbj2obj, o2h_idx, sbj2obj_idx, o2h, sbj2obj_vector = point2point_signed(verts[:,hand_idx], verts_obj,y_normals=obj_normals,return_vector=True) #y_normals=obj_normals
             point2point_time = time.time() - point2point_start
             
-            # J_rhand=jtr[:,40:55]
-            
-            # list_30=[4775, 4644, 4957, 5001, 5012, 5069, 5218, 5246, 5302, 5194,
-            #  5086, 5181, 4601, 4730, 5354, 7511, 7380, 7693, 
-            #  7737, 7710, 7805, 7954, 7982, 8038, 7930, 7822, 7917, 7338, 7466, 8093]
-            # rhand_indexes=np.array(list_30)[15:30]
-            
-            # EXTRA_IDS=[7669,7794,8022,7905,8070]
-            # comments: 这里jtr是什么，为什么要计算手部关节之间的距离？
             if left_or_right==1:
                 loss_touch = 0.05 * torch.sum(((jtr[:,[41,42,44,45,47,48,50,51,53,54]] - jtr[:,[40,41,43,44,46,47,49,50,52,53]])**2) * WHETHER_TOUCH.view(-1,1,1))#+ 1*torch.sum(h2o_signed**2)
             elif left_or_right==0:
@@ -2257,9 +1615,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
             loss_dist_o = torch.tensor(0.0).to(device)
             loss_verts_reg = torch.tensor(0)
 
-            ## intersection
-            # sbj2obj = intersection( verts[:,hand_idx], verts_obj, sbj_m.f, torch.tensor(obj_info['faces'].astype(np.int64)).to(device), do_sbj2obj=True,do_obj2sbj=False)#,full_body=True, adjacency_matrix=None):
-            # print(sbj2obj.shape,'SBJ2OBJ',verts.shape,'JKJKJKJII')
             thresh = 0.00
             #print(torch.min(sbj2obj[:,hand_idx]),'VALUE-kaolin')
             
@@ -2269,16 +1624,10 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
             contact_loop_start = time.time()
             for i in range(16):
                 num_verts = HAND_INDEXES[i].shape[0]
-                # comment: sbj2obj shape (N, T)
                 sd_i = sbj2obj[:,HAND_INDEXES[i]]
                 MASK_I = sd_i < thresh
-                # print(sd_i.shape)
-                # print(MASK_I.shape)
-                # print(sd_i[MASK_I][0])
                 whether_pene_time = torch.sum(MASK_I,dim=-1) ## T
                 MASK_TIME = (whether_pene_time>0).detach()
-                # print(h2o_signed.shape,MASK_TIME.shape)
-                # print(MASK_TIME)
                 SUMM=torch.sum(MASK_TIME)
                 # print(SUMM,epoch,i)
                 if torch.sum(MASK_TIME)>0:
@@ -2359,7 +1708,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
             
             #print(hand_pose_rec.shape,'QQQ')
             euler_angles = hand_pose_rec[:,:,[2,1,0]]
-            #euler_angles=matrix_to_euler_angles(axis_angle_to_matrix(hand_pose_rec).float(),convention='ZYX').float()
             if not left_or_right:
                 #torch.tensor([-1.0,-1.0,1.0]).to(device).reshape(1,1,3)
                 euler_angles=euler_angles*(torch.tensor([-1.0,-1.0,1.0]).to(device).reshape(1,1,3))
@@ -2425,7 +1773,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
 
             if epoch>100:
                 hand_verts=verts[:,hand_idx]
-                # comment: 这三部分在计算什么
                 smooth_start = time.time()
                 loss_hand_pose_v_reg=smooth_mask(hand_pose_rec,hand_verts,(WHETHER_TOUCH).view(-1,1,1))*0.5
                 loss_hand_pose_v_reg+=smooth_mask(hand_pose_rec,hand_verts,(WHETHER_OPTIMIZE-WHETHER_TOUCH).view(-1,1,1))
@@ -2434,7 +1781,6 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
 
                 
                 ## Initialization reg
-                # comment: 非接触帧手部姿态尽量靠近平均姿态
                 loss_hand_pose_v_reg+=0.05*torch.sum((hand_pose_rec-hand_mean_single.view(1,-1,3))**2*(1-WHETHER_TOUCH_L).view(-1,1,1))
                 
                 
@@ -2485,12 +1831,12 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
                 loss_dict['reg_v'] = loss_v_reg.detach()
             
             # Print timing information every epoch
-            if epoch % 50 == 0:
-                print(f"  [Timing] Point2Point: {point2point_time:.3f}s, Contact Loop: {contact_loop_time:.3f}s")
-                if epoch > 100:
-                    print(f"  [Timing] Smooth Mask: {smooth_time:.3f}s")
-                if epoch > 200:
-                    print(f"  [Timing] Hand Prior: {prior_time:.3f}s")
+            # if epoch % 50 == 0:
+            #     print(f"  [Timing] Point2Point: {point2point_time:.3f}s, Contact Loop: {contact_loop_time:.3f}s")
+            #     if epoch > 100:
+            #         print(f"  [Timing] Smooth Mask: {smooth_time:.3f}s")
+            #     if epoch > 200:
+            #         print(f"  [Timing] Hand Prior: {prior_time:.3f}s")
                     
         return loss, collision_loss, loss_dict
 
@@ -2526,15 +1872,14 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
         collision_loss_all=collision_loss_left+collision_loss_right
         
         # Print timing summary every epoch
-        if epoch % 1 == 0:
-            print(f"  [Timing] SMPLX: {smplx_time:.3f}s, Left Loss: {left_loss_time:.3f}s, Right Loss: {right_loss_time:.3f}s")
+        # if epoch % 1 == 0:
+        #     print(f"  [Timing] SMPLX: {smplx_time:.3f}s, Left Loss: {left_loss_time:.3f}s, Right Loss: {right_loss_time:.3f}s")
             
         return loss_all*LOSS_RATIO, collision_loss_all, loss_dict_all, None
         
     best_eval_grasp = 1e7
     tmp_smplhparams = {}
     tmp_objparams = {}
-    #lhand_mean=axis_angle_to_matrix(torch.tensor(np.load('./exp/smplx_lhand_mean.npy')).reshape(1,-1,3).float()).float().repeat(bs,1,1,1).to(device)
     rhand_mean=np.load(f'./exp/{HAND_MEAN_TITLE}_rhand_mean.npy')
     rhand_mean_torch=torch.from_numpy(rhand_mean.reshape(1,-1,3)).float().to(device).repeat(frame_times,1,1)
     lhand_mean=np.load(f'./exp/{HAND_MEAN_TITLE}_lhand_mean.npy')
@@ -2571,11 +1916,7 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
         
         epoch_time = time.time() - epoch_start_time
         
-        if ii % 1 == 0:  # Print every epoch
-            print(f"Epoch {ii}: Total={epoch_time:.2f}s, Loss={loss_time:.2f}s, Backward={backward_time:.2f}s, Step={step_time:.2f}s")
-            print(f"  Losses: {losses_str}")
         
-        #print(hand_pose_rec.grad)
         eval_grasp = loss
 
         if ii > 1: #and eval_grasp < best_eval_grasp:  # and contact_num>=5:
@@ -2597,95 +1938,168 @@ def optimize_finger(index, name, visualize=False, fname='', render_path=''):
     os.makedirs(render_path, exist_ok=True)
     save_path = os.path.join(render_path, fname+'.npy')
     np.save(save_path,hand_pose)
-    export_file_losses = f"{save_path}_optimization_0.22_f_losses/"
-    os.makedirs(export_file_losses, exist_ok=True)
-    save_path = os.path.join(export_file_losses, fname+'.pkl')
-    with open(save_path,'wb') as f:
-        pickle.dump(loss_dict,f)
+    # export_file_losses = f"{save_path}_optimization_0.22_f_losses/"
+    # os.makedirs(export_file_losses, exist_ok=True)
+    # save_path = os.path.join(export_file_losses, fname+'.pkl')
+    # with open(save_path,'wb') as f:
+    #     pickle.dump(loss_dict,f)
         
     visualize_body_obj(SBJ_OUTPUT.v.detach().cpu().numpy(), sbj_m.f.detach().cpu().numpy(), verts_obj.detach().cpu().numpy(), obj_info['faces'], save_path=os.path.join(render_path,f'{fname}_finger.mp4'),show_frame=True, multi_angle=True)
 
     return tmp_smplhparams, tmp_objparams
 
+def axis_angle_to_quat(aa):
+    # aa: (..., 3) axis-angle, angle = ||aa||
+    angle = torch.linalg.norm(aa, dim=-1, keepdims=True).clamp_min(1e-8)
+    axis  = aa / angle
+    half  = 0.5 * angle
+    sin_h = torch.sin(half)
+    cos_h = torch.cos(half)
+    # quaternion layout: (x, y, z, w)
+    return torch.cat([axis * sin_h, cos_h], dim=-1)
 
-def analyze_pose_changes(original_poses, optimized_poses, fixed_joints_mask, joint_optimization_mask):
+def quat_conjugate(q):
+    return torch.cat([-q[..., :3], q[..., 3:]], dim=-1)
+
+def quat_mul(a, b):
+    ax, ay, az, aw = a.unbind(-1)
+    bx, by, bz, bw = b.unbind(-1)
+    x = aw*bx + ax*bw + ay*bz - az*by
+    y = aw*by - ax*bz + ay*bw + az*bx
+    z = aw*bz + ax*by - ay*bx + az*bw
+    w = aw*bw - ax*bx - ay*by - az*bz
+    return torch.stack([x,y,z,w], dim=-1)
+
+def quat_normalize(q, eps=1e-8):
+    return q / (q.norm(dim=-1, keepdim=True) + eps)
+
+def quat_to_angle_axis(q, eps=1e-8):
+    q = quat_normalize(q)
+    w = q[..., 3].clamp(-1.0, 1.0)
+    angle = 2.0 * torch.acos(w)                      # [0, pi]
+    sin_half = torch.sqrt((1.0 - w*w).clamp_min(0))  # = ||xyz||
+    axis = torch.zeros_like(q[..., :3])
+    mask = sin_half > 1e-5
+    axis[mask] = q[..., :3][mask] / sin_half[mask].unsqueeze(-1)
+    axis[~mask] = torch.tensor([0.,0.,1.], device=q.device, dtype=q.dtype)  # default
+    return angle, axis
+
+def quat_from_axis_angle(axis, angle, eps=1e-8):
+    if not isinstance(axis, torch.Tensor): axis = torch.tensor(axis, dtype=torch.float32)
+    if not isinstance(angle, torch.Tensor): angle = torch.tensor(angle, dtype=torch.float32)
+    # normalize axis defensively
+    axis = axis / (axis.norm(dim=-1, keepdim=True) + eps)
+    half = 0.5 * angle
+    s = torch.sin(half)[..., None]
+    c = torch.cos(half)[..., None]
+    return torch.cat([axis * s, c], dim=-1)
+    
+def pose_delta_axis_angle(poses):
+    # poses: (T, N, 3)
+    T, N, _ = poses.shape
+    q = axis_angle_to_quat(poses)                # (T, N, 4)
+    q_prev = q[:-1]                               # (T-1, N, 4)
+    q_curr = q[1:]
+    q_rel  = quat_mul(quat_conjugate(q_prev), q_curr)
+    q_rel  = quat_normalize(q_rel)
+    diff_angle, diff_axis = quat_to_angle_axis(q_rel)  # (T-1, N), (T-1, N, 3)
+    return diff_angle, diff_axis
+
+def reverse_rotate(pose_t1_aa, diff_angle, diff_axis):
     """
-    Analyze and report changes in poses before and after optimization.
-    
-    Args:
-        original_poses: (T, 156) - Original poses before optimization
-        optimized_poses: (T, 156) - Poses after optimization
-        fixed_joints_mask: (T, 8) - Which joint-frame combinations were fixed
-        joint_optimization_mask: (8,) - Which joints were optimized
+    Rotate pose at t+1 back to pose at t. Returns axis-angle vector (...,3).
     """
-    print("\n" + "="*80)
-    print("POSE CHANGE ANALYSIS")
-    print("="*80)
-    
-    # Joint names and their pose indices
-    joint_info = [
-        ("left_collar", 39, 42),
-        ("right_collar", 42, 45),
-        ("left_shoulder", 48, 51),
-        ("right_shoulder", 51, 54),
-        ("left_elbow", 54, 57),
-        ("right_elbow", 57, 60),
-        ("left_wrist", 60, 63),
-        ("right_wrist", 63, 66)
-    ]
-    
-    # Calculate changes for each joint
-    total_changes = 0
-    significant_changes = 0
-    threshold = 0.01  # 0.01 radians ≈ 0.57 degrees
-    
-    for joint_idx, (joint_name, start_idx, end_idx) in enumerate(joint_info):
-        if not joint_optimization_mask[joint_idx]:
-            print(f"{joint_name:15s}: NOT OPTIMIZED (was never fixed)")
-            continue
-            
-        # Extract pose parameters for this joint
-        original_joint_poses = original_poses[:, start_idx:end_idx]  # (T, 3)
-        optimized_joint_poses = optimized_poses[:, start_idx:end_idx]  # (T, 3)
-        
-        # Calculate absolute differences
-        pose_diff = np.abs(optimized_joint_poses - original_joint_poses)  # (T, 3)
-        max_diff = np.max(pose_diff)
-        mean_diff = np.mean(pose_diff)
-        
-        # Count frames with significant changes
-        significant_frames = np.sum(pose_diff > threshold, axis=1)  # (T,) - count per frame
-        frames_with_changes = np.sum(significant_frames > 0)  # Total frames with any significant change
-        
-        # Check which frames were actually fixed
-        fixed_frames_for_joint = np.where(fixed_joints_mask[:, joint_idx].cpu().numpy())[0]
-        num_fixed_frames = len(fixed_frames_for_joint)
-        
-        print(f"{joint_name:15s}:")
-        print(f"  {'':15s}  Fixed frames: {num_fixed_frames}")
-        if num_fixed_frames > 0:
-            print(f"  {'':15s}  Specific frames with changes: {fixed_frames_for_joint.tolist()}")
-        print(f"  {'':15s}  Max change: {max_diff:.6f} rad ({np.degrees(max_diff):.2f}°)")
-        print(f"  {'':15s}  Mean change: {mean_diff:.6f} rad ({np.degrees(mean_diff):.2f}°)")
-        print(f"  {'':15s}  Frames with changes: {frames_with_changes}/{original_poses.shape[0]}")
-        
-        if frames_with_changes > 0:
-            total_changes += frames_with_changes
-            if max_diff > threshold:
-                significant_changes += 1
-    
-    print(f"\nSUMMARY:")
-    print(f"  Total frames with changes: {total_changes}")
-    print(f"  Joints with significant changes: {significant_changes}/{joint_optimization_mask.sum()}")
-    print(f"  Optimization threshold: {threshold:.3f} rad ({np.degrees(threshold):.1f}°)")
-    
-    # Check if any poses were actually changed
-    if total_changes == 0:
-        print("  ⚠️  WARNING: No pose changes detected! Check if optimization is working.")
+    q_t1   = quat_normalize(axis_angle_to_quat(pose_t1_aa))
+    q_corr = quat_from_axis_angle(diff_axis, -diff_angle)   # inverse of delta
+    q_t    = quat_normalize(quat_mul(q_t1, q_corr))
+    ang, ax = quat_to_angle_axis(q_t)                       # tensors
+    return ax * ang.unsqueeze(-1)                           # axis-angle vector
+
+def forward_rotate(pose_t_aa, diff_angle, diff_axis):
+    """
+    Rotate pose at t forward to pose at t+1. Returns axis-angle vector (...,3).
+    """
+    q_t    = quat_normalize(axis_angle_to_quat(pose_t_aa))
+    q_corr = quat_from_axis_angle(diff_axis,  diff_angle)   # apply delta
+    q_t1   = quat_normalize(quat_mul(q_t, q_corr))
+    ang, ax = quat_to_angle_axis(q_t1)
+    return ax * ang.unsqueeze(-1)
+
+def fix_joint_poses_simple(poses, joint_idx, angle_thresh=0.2, max_passes=3):
+    """
+    poses: (T, 156) or (T, 52, 3) axis-angle.  Assumes segment 0 is good.
+    For any boundary (t -> t+1) with diff_angle > angle_thresh for this joint,
+    take the segment after that boundary and reverse-rotate all its frames by that boundary's delta.
+    After fixing one segment, recompute diffs and continue, up to max_passes.
+    Returns: poses_fixed (same shape), fixed_boundaries (list of t indices used)
+    """
+    # reshape to (T, 52, 3)
+    if poses.ndim == 2 and poses.shape[1] == 156:
+        if isinstance(poses, torch.Tensor):
+            poses_reshaped = poses.reshape(poses.shape[0], 52, 3).clone()
+        else:
+            poses_reshaped = poses.reshape(poses.shape[0], 52, 3).copy()
+    elif poses.ndim == 3 and poses.shape[1:] == (52, 3):
+        if isinstance(poses, torch.Tensor):
+            poses_reshaped = poses.clone()
+        else:
+            poses_reshaped = poses.copy()
     else:
-        print(f"  ✅  Optimization successful: {total_changes} pose changes detected.")
-    
-    print("="*80 + "\n")
+        raise ValueError("poses must be (T,156) or (T,52,3) axis-angle")
+
+    torch_device = None
+    np_input = not isinstance(poses_reshaped, torch.Tensor)
+    if np_input:
+        poses_t = torch.tensor(poses_reshaped, dtype=torch.float32)
+    else:
+        poses_t = poses_reshaped.float()
+        torch_device = poses_t.device
+
+    T = poses_t.shape[0]
+    fixed_boundaries = []
+
+    for _ in range(max_passes):
+        diff_angle, diff_axis = pose_delta_axis_angle(poses_t)   # (T-1, N), (T-1, N, 3)
+        # flips for this joint
+        da = diff_angle[:, joint_idx]       # (T-1,)
+        ax = diff_axis[:, joint_idx, :]     # (T-1,3)
+
+        # find boundaries with big jumps
+        flip_idxs = torch.nonzero(da > angle_thresh, as_tuple=False).flatten().tolist()
+        if not flip_idxs:
+            break
+
+        # Always take the earliest boundary first, fix the segment after it.
+        b = flip_idxs[0]                     # boundary between b (good) and b+1.. (bad)
+        angle_b = da[b]
+        axis_b  = ax[b]
+
+        # reverse-rotate ALL frames from b+1 to the next flip (or to end)
+        next_b = next((k for k in flip_idxs[1:] if k > b), None)
+        seg_start = b + 1
+        seg_end = (next_b if next_b is not None else (T-1))  # inclusive end boundary for rotations
+        # we rotate frames seg_start..(T-1) for the target joint; per your spec, whole segment to the end of that segment
+        target_slice = slice(seg_start, seg_end + 1)
+
+        # apply reverse rotation to that joint across the segment
+        poses_t[target_slice, joint_idx, :] = reverse_rotate(
+            poses_t[target_slice, joint_idx, :], angle_b, axis_b
+        )
+        fixed_boundaries.append(int(b))
+        # loop continues: recompute diffs and handle next earliest boundary (after update)
+
+    poses_fixed = poses_t
+    if np_input:
+        poses_fixed = poses_fixed.cpu().numpy()
+        # reshape back to original
+        if poses.ndim == 2:
+            poses_fixed = poses_fixed.reshape(T, 156)
+    else:
+        if poses.ndim == 2:
+            poses_fixed = poses_fixed.reshape(T, 156)
+
+    return poses_fixed, fixed_boundaries
+
 
 def quick_pose_comparison(original_poses, optimized_poses, joint_names=None):
     """
@@ -2848,408 +2262,352 @@ def get_mean_pose_joints(name, gender, model_type, num_betas, use_pca=False):
 
     return joints
 
-def main(dataset_path, sequence_name):
+def main(dataset_path, sequence_name, threshold, whole_dataset):
     """Main pipeline function - Supports all datasets for Steps 1&2, SMPLX16 for optimization"""
-    print(f"Starting comprehensive pipeline for {sequence_name}")
+    # print(f"Starting comprehensive pipeline for {sequence_name}")
     
     # Derived paths
     human_path = os.path.join(dataset_path, 'sequences_canonical')
     object_path = os.path.join(dataset_path, 'objects')
     dataset_path_name = dataset_path.split('/')[-1]
-
-    # Load data based on dataset
-    if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
-        verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplh', 10)
-        canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplh', 10)
-    elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
-        verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplh', 16)
-        canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplh', 16)
-    elif dataset_path_name.upper() == 'CHAIRS':
-        verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 10)
-        canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 10)
-    elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
-        verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 10, True)
-        canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 10, True)
-    elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
-        verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 16)
-        canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 16)
+    # fixed_sequence_name = []
+    if whole_dataset:
+        data_name = os.listdir(human_path)
+        # data_name = random.sample(data_name, 20)
     else:
-        raise ValueError(f"Unsupported dataset: {dataset_path_name}")
-
-    # Load object data
-    with np.load(os.path.join(human_path, sequence_name, 'object.npz'), allow_pickle=True) as f:
-        obj_angles, obj_trans, obj_name = f['angles'], f['trans'], str(f['name'])
-    angle_matrix = Rotation.from_rotvec(obj_angles).as_matrix()
-
-    OBJ_MESH = trimesh.load(os.path.join(object_path, obj_name, obj_name+'.obj'))
-    # For now, create a mock object mesh
-    # OBJ_MESH = type('MockMesh', (), {'vertices': np.zeros((100, 3)), 'faces': np.zeros((50, 3), dtype=np.int32)})()
-    print("object name:", obj_name)
-    ov = np.array(OBJ_MESH.vertices).astype(np.float32)
-    object_faces = OBJ_MESH.faces.astype(np.int32)
-    device = torch.device('cuda:0')
-    ov = torch.from_numpy(ov).float().to(device)
-    rot = torch.tensor(angle_matrix).float().to(device)
-    obj_trans = torch.tensor(obj_trans).float().to(device)
-    object_verts = torch.einsum('ni,tij->tnj', ov, rot.permute(0,2,1)) + obj_trans.unsqueeze(1)
-
-    T = poses.shape[0]
-    print(f"Processing {T} frames")
-            
-    # Pre-compute hand-object distances for the original sequence to create distance masks
-    print("Pre-computing hand-object distances for distance-based optimization...")
-    # Ensure verts is on the same device as object_verts
-    if isinstance(verts, torch.Tensor):
-        verts = verts.to(device)
-    else:
-        verts = torch.from_numpy(verts).float().to(device)
-    obj_normals=vertex_normals(object_verts,torch.tensor(object_faces.astype(np.float32)).unsqueeze(0).repeat(object_verts.shape[0],1,1).to(device))
-    distance_info = precompute_hand_object_distances(verts, object_verts, obj_normals, rhand_idx, lhand_idx)
+        data_name = [sequence_name]
+    # use tqdm to show the progress
+    # randomly select 20 sequences from data_name
     
-    # Print contact information for both hands
-    if distance_info is not None:
-        # Get contact frames (where distance <= 0.02m = 2cm)
-        # left_contact_frames = torch.where(distance_info['left_contact_mask'])[0].tolist()
-        # right_contact_frames = torch.where(distance_info['right_contact_mask'])[0].tolist()
-        left_pen_frames = torch.where(distance_info['left_pen_mask'])[0].tolist()
-        right_pen_frames = torch.where(distance_info['right_pen_mask'])[0].tolist()
-        
-        # Convert to unique frame indices (since each frame has 778 hand vertices)
-        left_pen_unique_frames = sorted(list(set(left_pen_frames)))
-        right_pen_unique_frames = sorted(list(set(right_pen_frames)))
-        
-        print("Left hand penetration at frames:", left_pen_unique_frames)
-        print("Right hand penetration at frames:", right_pen_unique_frames)
-        
-        # Print summary statistics
-        print(f"Left hand: {len(left_pen_unique_frames)} frames with penetration out of {T} total frames")
-        print(f"Right hand: {len(right_pen_unique_frames)} frames with penetration out of {T} total frames")
-        
-        # Also show contact frames for reference
-        left_contact_frames = torch.where(distance_info['left_contact_mask'])[0].tolist()
-        right_contact_frames = torch.where(distance_info['right_contact_mask'])[0].tolist()
-        left_contact_unique_frames = sorted(list(set(left_contact_frames)))
-        right_contact_unique_frames = sorted(list(set(right_contact_frames)))
-        
-        print("Left hand contact at frames:", left_contact_unique_frames)
-        print("Right hand contact at frames:", right_contact_unique_frames)
-        print(f"Left hand: {len(left_contact_unique_frames)} contact frames, {len(left_pen_unique_frames)} penetration frames")
-        print(f"Right hand: {len(right_contact_unique_frames)} contact frames, {len(right_pen_unique_frames)} penetration frames")
-        # print(f"Left hand: {len(left_contact_frames)} contact frames out of {len(distance_info['left_contact_mask'])} total frames")
-        # print(f"Right hand: {len(right_contact_frames)} contact frames out of {len(distance_info['right_contact_mask'])} total frames")
-    else:
-        print("Distance info not available")
-    if distance_info is not None:
-        print("Distance masks computed successfully - using distance-limited penetration loss")
-    else:
-        print("Distance masks not available - using standard penetration loss")
-        
-
-    # Initialize fix tracker
-    fix_tracker = FixTracker(T)
-
-    # Step 1: Joint pose fixing (exact implementation from joint_pose_fix.py)
-    print("\n=== Step 1: Joint Pose Fixing ===")
-    
-    # Use the exact joint pose fixing logic from joint_pose_fix.py
-    # First, get orientation masks for both hands
-    print("Computing palm contact and orientation masks...")
-    contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='left'
-    )
-    
-    contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
-        joints, object_verts, hand='right'
-    )
-    
-    print(f"Left hand: {contact_mask_l.sum().item()}/{len(contact_mask_l)} contact frames, {orient_mask_l.sum().item()}/{len(orient_mask_l)} correct orientation")
-    print(f"Right hand: {contact_mask_r.sum().item()}/{len(contact_mask_r)} contact frames, {orient_mask_r.sum().item()}/{len(contact_mask_r)} correct orientation")
-    
-    # Compute wrist twist angles and create bound masks
-    print("Computing wrist twist angles and bound masks...")
-    twist_left_list, twist_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
-    
-    # Create twist angle bound masks
-    T = len(twist_left_list)
-    left_twist_bound_mask = [(tw > 90 or tw < -110) for tw in twist_left_list]
-    right_twist_bound_mask = [(tw > 110 or tw < -90) for tw in twist_right_list]
-    
-    print(f"Left twist out-of-bounds frames: {sum(left_twist_bound_mask)}/{T}")
-    print(f"Right twist out-of-bounds frames: {sum(right_twist_bound_mask)}/{T}")
-    
-    # Track which frames were fixed for each joint using exact information from fix_joint_poses
-    joint_fixed_frames = {joint_idx: [] for joint_idx in [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]}
-    
-    # Iteratively fix all joints together (exact logic from joint_pose_fix.py)
-    iteration = 0
-    prev_total_flips = float('inf')
-    
-    while True:
-        iteration += 1
-        print(f"\nIteration {iteration} - Processing all joints together...")
-        
-        # Track total flips across all joints
-        total_flips = 0
-        joint_flip_counts = {}
-        prev_poses = poses
-        # Process each joint in this iteration
-        for joint_idx in [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]:
-            # Determine which orientation mask to use based on the joint
-            if joint_idx in [LEFT_COLLAR, LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST]:
-                orient_mask = orient_mask_l
-            else:  # RIGHT_COLLAR, RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST
-                orient_mask = orient_mask_r
-            
-            # Detect flips for this joint
-            flip_indices, angle_diffs, relative_axes = detect_flips(poses, joint_idx, threshold=20)
-            current_flip_count = len(flip_indices)
-            joint_flip_counts[joint_idx] = current_flip_count
-            total_flips += current_flip_count
-            
-            if current_flip_count > 0:
-                print(f"  Joint {joint_idx}: {current_flip_count} flips at frames: {flip_indices}")
-                
-                # Fix the poses for this joint using exact logic from joint_pose_fix.py
-                poses, fixed_frames = fix_joint_poses(
-                    poses, flip_indices, orient_mask, 
-                    joint_idx, angle_diffs, relative_axes, canonical_joints, 20,
-                    left_twist_bound_mask, right_twist_bound_mask
-                )
-                
-                # Track which frames were actually fixed for this joint using the exact information returned
-                joint_fixed_frames[joint_idx].extend(fixed_frames)
-                # Ensure unique frame indices (in case the same joint is processed multiple times across iterations)
-                joint_fixed_frames[joint_idx] = list(set(joint_fixed_frames[joint_idx]))
-                print(f"    Joint {joint_idx}: {len(fixed_frames)} frames fixed in this iteration")
-            else:
-                print(f"  Joint {joint_idx}: No flips detected")
-
-        print(f"  Total flips across all joints: {total_flips}")
+    for sequence_name in tqdm(data_name):
+        # if exists human_fixed.npz, skip
+        # if os.path.exists(os.path.join(human_path, sequence_name, 'human_fixed.npz')):
+        #     print(f"Skipping {sequence_name} because it already has human_fixed.npz")
+        #     continue
         if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
-            _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 10)
+            verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplh', 10)
+            canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplh', 10)
         elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
-            _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 16)
+            verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplh', 16)
+            canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplh', 16)
         elif dataset_path_name.upper() == 'CHAIRS':
-            _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10)
+            verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 10)
+            canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 10)
         elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
-            _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
+            verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 10, True)
+            canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 10, True)
         elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
-            _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 16)
+            verts, joints, faces, poses, betas, trans, gender = visualize_smpl(sequence_name, human_path, 'smplx', 16)
+            canonical_joints = get_mean_pose_joints(sequence_name, gender, 'smplx', 16)
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset_path_name}")
 
+        # Load object data
+        with np.load(os.path.join(human_path, sequence_name, 'object.npz'), allow_pickle=True) as f:
+            obj_angles, obj_trans, obj_name = f['angles'], f['trans'], str(f['name'])
+        angle_matrix = Rotation.from_rotvec(obj_angles).as_matrix()
+
+        OBJ_MESH = trimesh.load(os.path.join(object_path, obj_name, obj_name+'.obj'))
+
+        ov = np.array(OBJ_MESH.vertices).astype(np.float32)
+        object_faces = OBJ_MESH.faces.astype(np.int32)
+        device = torch.device('cuda:0')
+        ov = torch.from_numpy(ov).float().to(device)
+        rot = torch.tensor(angle_matrix).float().to(device)
+        obj_trans = torch.tensor(obj_trans).float().to(device)
+        object_verts = torch.einsum('ni,tij->tnj', ov, rot.permute(0,2,1)) + obj_trans.unsqueeze(1)
+        render_path = f'./save_fix/{dataset_path_name}'
+        os.makedirs(render_path, exist_ok=True)
+        T = poses.shape[0]
+
+        if isinstance(verts, torch.Tensor):
+            verts = verts.to(device)
+        else:
+            verts = torch.from_numpy(verts).float().to(device)
+
+        if args.visualize:
+            visualize_body_obj(
+                verts.float().detach().cpu().numpy(),
+                faces[0].detach().cpu().numpy().astype(np.int32),
+                object_verts.detach().cpu().numpy(),
+                object_faces,
+                save_path=os.path.join(render_path, f'{sequence_name}_original.mp4'),
+                show_frame=True,
+                multi_angle=True,
+            )
+        joints = joints.to(device)
+        
+        # Pre-compute hand-object distances for the original sequence to create distance masks
+        # print("Pre-computing hand-object distances for distance-based optimization...")
+        # Ensure verts is on the same device as object_verts
+    
+        obj_normals=vertex_normals(object_verts,torch.tensor(object_faces.astype(np.float32)).unsqueeze(0).repeat(object_verts.shape[0],1,1).to(device))
+        distance_info = precompute_hand_object_distances(verts, object_verts, obj_normals, rhand_idx, lhand_idx)
+        
+        # Print contact information for both hands
+        if distance_info is not None:
+            # Get contact frames (where distance <= 0.02m = 2cm)
+            # left_contact_frames = torch.where(distance_info['left_contact_mask'])[0].tolist()
+            # right_contact_frames = torch.where(distance_info['right_contact_mask'])[0].tolist()
+            left_pen_frames = torch.where(distance_info['left_pen_mask'])[0].tolist()
+            right_pen_frames = torch.where(distance_info['right_pen_mask'])[0].tolist()
+            
+            # Convert to unique frame indices (since each frame has 778 hand vertices)
+            left_pen_unique_frames = sorted(list(set(left_pen_frames)))
+            right_pen_unique_frames = sorted(list(set(right_pen_frames)))
+            
+            # print("Left hand penetration at frames:", left_pen_unique_frames)
+            # print("Right hand penetration at frames:", right_pen_unique_frames)
+            
+            # Print summary statistics
+            # print(f"Left hand: {len(left_pen_unique_frames)} frames with penetration out of {T} total frames")
+            # print(f"Right hand: {len(right_pen_unique_frames)} frames with penetration out of {T} total frames")
+            
+            # Also show contact frames for reference
+            left_contact_frames = torch.where(distance_info['left_contact_mask'])[0].tolist()
+            right_contact_frames = torch.where(distance_info['right_contact_mask'])[0].tolist()
+            left_contact_unique_frames = sorted(list(set(left_contact_frames)))
+            right_contact_unique_frames = sorted(list(set(right_contact_frames)))
+        else:
+            print("Distance info not available")
+
+
+        # Initialize fix tracker
+        fix_tracker = FixTracker(T)
+
+        joints_to_fix = []
+        # find the joints with any diff_angle > 0.4
+            
+        # Track which frames were fixed for each joint using exact information from fix_joint_poses
+        joint_fixed_frames = {joint_idx: [] for joint_idx in [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]}
+        if isinstance(poses, np.ndarray):
+            poses = torch.from_numpy(poses).float()  # now a torch.Tensor
+        # view poses from (N, 156) to (N, 52, 3)
+        poses = poses.reshape(-1, 52, 3)
+        diff_angle, diff_axis = pose_delta_axis_angle(poses)
+        
+        for j in [13, 16, 18, 20, 14, 17, 19, 21]:
+            for i in range(diff_angle.shape[0]):
+                if abs(diff_angle[i, j]) > threshold:
+                    joints_to_fix.append(j)
+                    break
+
+        for joint in joints_to_fix:
+            poses, fixed_boundaries = fix_joint_poses_simple(poses, joint, angle_thresh=threshold, max_passes=50)
+            # print(f"Fixed joints {joint} at {fixed_boundaries}")
+            joint_fixed_frames[joint].extend(range(fixed_boundaries[0],poses.shape[0]))
+        
+        joint_to_tracker_idx = {
+            LEFT_COLLAR: 0, RIGHT_COLLAR: 1,
+            LEFT_SHOULDER: 2, RIGHT_SHOULDER: 3,
+            LEFT_ELBOW: 4, RIGHT_ELBOW: 5,
+            LEFT_WRIST: 6, RIGHT_WRIST: 7
+        }
+        
+        # Mark the frames that were actually fixed during the joint pose fixing process
+        for joint_idx, fixed_frames in joint_fixed_frames.items():
+            if fixed_frames:  # Only process joints that had frames fixed
+                tracker_joint_idx = joint_to_tracker_idx[joint_idx]
+                # print(f"Joint {joint_idx}: {len(fixed_frames)} frames fixed")
+                fix_tracker.mark_joint_fixed(fixed_frames, [tracker_joint_idx])
+        
+        total_joint_fixes = fix_tracker.get_joint_fixed_frames_and_joints().sum()
+        # print(f"Joint pose fixing applied to {total_joint_fixes} joint-frame combinations")
+        
+        poses = poses.reshape(-1, 156)
+        poses = poses.cpu().numpy()
+        if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
+            verts, joints, faces = regen_smpl(args.sequence_name, poses, betas, trans, gender, 'smplh', 10)
+        elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
+            verts, joints, faces = regen_smpl(args.sequence_name, poses, betas, trans, gender, 'smplh', 16)
+        elif dataset_path_name.upper() == 'CHAIRS':
+            verts, joints, faces = regen_smpl(args.sequence_name, poses, betas, trans, gender, 'smplx', 10)
+        elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
+            verts, joints, faces = regen_smpl(args.sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
+        elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
+            verts, joints, faces = regen_smpl(args.sequence_name, poses, betas, trans, gender, 'smplx', 16)
+
+
+        # Step 1: Joint pose fixing (exact implementation from joint_pose_fix.py)
+        # print("\n=== Step 1: Joint Pose Fixing ===")
+        
+        # Use the exact joint pose fixing logic from joint_pose_fix.py
+        # First, get orientation masks for both hands
+        # print("Computing palm contact and orientation masks...")
         contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
-            updated_joints, object_verts, hand='left'
+            joints, object_verts, hand='left'
         )
         
         contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
-            updated_joints, object_verts, hand='right'
+            joints, object_verts, hand='right'
         )
-        # Check if we should stop iterating
         
-        if total_flips == 0:
-            print(f"  No flips remaining across all joints - stopping iterations")
-            break
-        # elif total_flips > prev_total_flips:
-        #     print(f"  Total flip count did not decrease ({prev_total_flips} -> {total_flips}) - stopping iterations")
-        #     poses = prev_poses
-        #     break
-        else:
-            print(f"  Total flip count decreased from {prev_total_flips} to {total_flips} - continuing iterations")
-        # Update for next iteration
-        prev_total_flips = total_flips
+        # print(f"Left hand: {contact_mask_l.sum().item()}/{len(contact_mask_l)} contact frames, {orient_mask_l.sum().item()}/{len(orient_mask_l)} correct orientation")
+        # print(f"Right hand: {contact_mask_r.sum().item()}/{len(contact_mask_r)} contact frames, {orient_mask_r.sum().item()}/{len(contact_mask_r)} correct orientation")
         
-        # Safety check to prevent infinite loops
-        if iteration > 20:
-            print(f"  Reached maximum iterations (20) - stopping")
-            break
-    print(f"\nCompleted {iteration} iterations across all joints")
-    print("Final flip counts per joint:")
-    for joint_idx in [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]:
-        flip_indices, _, _ = detect_flips(poses, joint_idx, threshold=20)
-        print(f"  Joint {joint_idx}: {len(flip_indices)} flips")
-    
-    # Track which frames and joints were fixed by joint pose fixing
-    joints_to_fix = [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]
-    joint_to_tracker_idx = {
-        LEFT_COLLAR: 0, RIGHT_COLLAR: 1,
-        LEFT_SHOULDER: 2, RIGHT_SHOULDER: 3,
-        LEFT_ELBOW: 4, RIGHT_ELBOW: 5,
-        LEFT_WRIST: 6, RIGHT_WRIST: 7
-    }
-    
-    # Mark the frames that were actually fixed during the joint pose fixing process
-    for joint_idx, fixed_frames in joint_fixed_frames.items():
-        if fixed_frames:  # Only process joints that had frames fixed
-            tracker_joint_idx = joint_to_tracker_idx[joint_idx]
-            print(f"Joint {joint_idx}: {len(fixed_frames)} frames fixed")
-            fix_tracker.mark_joint_fixed(fixed_frames, [tracker_joint_idx])
-    
-    total_joint_fixes = fix_tracker.get_joint_fixed_frames_and_joints().sum()
-    print(f"Joint pose fixing applied to {total_joint_fixes} joint-frame combinations")
-    
-    # Save temporary result after Step 1
-    render_path = f'./save_pipeline_fix/{dataset_path_name}'
-    os.makedirs(render_path, exist_ok=True)
-    temp_step1_path = os.path.join(render_path, f'{sequence_name}_step1_joint_fixed.npz')
-    np.savez(temp_step1_path, 
-             poses=poses, 
-             betas=betas, 
-             trans=trans, 
-             gender=gender)
-    print(f"Step 1 temporary result saved to: {temp_step1_path}")
+        # Compute wrist twist angles and create bound masks
+        # print("Computing wrist twist angles and bound masks...")
+        twist_left_list, twist_right_list, elbow_left_list, elbow_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
+        # Create twist angle bound masks
+        T = len(twist_left_list)
+        left_twist_bound_list = [(tw > 80 or tw < -110) for tw in twist_left_list]
+        right_twist_bound_list = [(tw > 110 or tw < -80) for tw in twist_right_list]
+        
+        # Convert lists to tensors for boolean operations
+        left_twist_bound_mask = torch.tensor(left_twist_bound_list, device=distance_info['left_close_mask'].device, dtype=torch.bool) & ~distance_info['left_close_mask']
+        right_twist_bound_mask = torch.tensor(right_twist_bound_list, device=distance_info['right_close_mask'].device, dtype=torch.bool) & ~distance_info['right_close_mask']
+        # print(f"Left twist out-of-bounds frames: {sum(left_twist_bound_mask)}/{T}")
+        # print(f"Right twist out-of-bounds frames: {sum(right_twist_bound_mask)}/{T}")
+        
+        # Fix left hand
+        axis_left = canonical_joints[LEFT_WRIST] - canonical_joints[LEFT_ELBOW]
+        axis_left /= np.linalg.norm(axis_left)
+        poses, left_fixed_frames = fix_left_palm(
+            twist_left_list, distance_info['left_close_mask'], orient_mask_l, poses, LEFT_WRIST, axis_left, joints, object_verts, obj_normals
+        )
+        # poses, left_fixed_frames = robust_wrist_flip_fix_left(twist_left_list, orient_mask_l, poses, LEFT_WRIST, axis_left, joints, object_verts)
+        if left_fixed_frames:
+            fix_tracker.mark_palm_fixed(left_fixed_frames, [6])  # left_wrist = index 6
+        # # Fix right hand
+        axis_right = canonical_joints[RIGHT_WRIST] - canonical_joints[RIGHT_ELBOW]
+        axis_right /= np.linalg.norm(axis_right)
+        poses, right_fixed_frames = fix_right_palm(
+            twist_right_list, distance_info['right_close_mask'], orient_mask_r, poses, RIGHT_WRIST, axis_right, joints, object_verts, obj_normals
+        )
+        if right_fixed_frames:
+            fix_tracker.mark_palm_fixed(right_fixed_frames, [7])  # right_wrist = index 7
+        twist_left_list, twist_right_list, elbow_left_list, elbow_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
+ 
 
-    # Step 2: Palm orientation fixing
-    print("\n=== Step 2: Palm Orientation Fixing ===")
-    
-    # Regenerate joints from updated poses after joint fixing
-    print("Regenerating joints from updated poses...")
-    if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
-        _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 10)
-    elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
-        _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 16)
-    elif dataset_path_name.upper() == 'CHAIRS':
-        _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10)
-    elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
-        _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
-    elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
-        _, updated_joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 16)
-    
-    # Compute twist angles for palm fixing
-    twist_left_list, twist_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
-    contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
-        updated_joints, object_verts, hand='left'
-    )
-    contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
-        updated_joints, object_verts, hand='right'
-    )
+        # Step 2: Palm orientation fixing
+        # print("\n=== Step 2: Palm Orientation Fixing ===")
+        
+        # Regenerate joints from updated poses after joint fixing
+        # print("Regenerating joints from updated poses...")
+        if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
+            _, joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 10)
+        elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
+            _, joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 16)
+        elif dataset_path_name.upper() == 'CHAIRS':
+            _, joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10)
+        elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
+            _, joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
+        elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
+            _, joints, _ = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 16)
+        
+        # Compute twist angles for palm fixing
+        twist_left_list, twist_right_list, elbow_left_list, elbow_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
+        contact_mask_l, orient_mask_l, _ = compute_palm_contact_and_orientation(
+            joints, object_verts, hand='left'
+        )
+        contact_mask_r, orient_mask_r, _ = compute_palm_contact_and_orientation(
+            joints, object_verts, hand='right'
+        )
 
-    # Fix left hand
-    axis_left = canonical_joints[LEFT_WRIST] - canonical_joints[LEFT_ELBOW]
-    axis_left /= np.linalg.norm(axis_left)
-    poses, left_fixed_frames = fix_left_palm(
-        twist_left_list, distance_info['left_close_mask'], orient_mask_l, poses, LEFT_WRIST, axis_left, updated_joints, object_verts, obj_normals
-    )
-    # poses, left_fixed_frames = robust_wrist_flip_fix_left(twist_left_list, orient_mask_l, poses, LEFT_WRIST, axis_left, updated_joints, object_verts)
-    if left_fixed_frames:
-        fix_tracker.mark_palm_fixed(left_fixed_frames, [6])  # left_wrist = index 6
-    # for t in range(poses.shape[0]):
-    #     print(f"Frame {t} left twist: {twist_left_list[t]} contact mask: {distance_info['left_close_mask'][t]} orient mask: {orient_mask_l[t]}")
-    # # Fix right hand
-    axis_right = canonical_joints[RIGHT_WRIST] - canonical_joints[RIGHT_ELBOW]
-    axis_right /= np.linalg.norm(axis_right)
-    poses, right_fixed_frames = fix_right_palm(
-        twist_right_list, distance_info['right_close_mask'], orient_mask_r, poses, RIGHT_WRIST, axis_right, updated_joints, object_verts, obj_normals
-    )
-    # poses, right_fixed_frames = robust_wrist_flip_fix_right(twist_right_list, orient_mask_r, poses, RIGHT_WRIST, axis_right, updated_joints, object_verts)
+        iteration = 0
+        prev_total_flips = float('inf')
+        
+        # Track which frames were fixed for each joint using exact information from fix_joint_poses
+        joint_fixed_frames = {joint_idx: [] for joint_idx in [LEFT_COLLAR, RIGHT_COLLAR, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]}
+        
     
-    if right_fixed_frames:
-        fix_tracker.mark_palm_fixed(right_fixed_frames, [7])  # right_wrist = index 7
-    twist_left_list, twist_right_list = detect_hand_twist_from_canonical_batch(poses, canonical_joints)
-    # for t in range(len(twist_left_list)):
-    #     print(f"Frame {t}: Left wrist twist angle: {twist_left_list[t]:.1f} deg")
-    #     print(f"Frame {t}: Right wrist twist angle: {twist_right_list[t]:.1f} deg")
-    temp_step2_path = os.path.join(render_path, f'{sequence_name}_step2_palm_fixed.npz')
-    np.savez(temp_step2_path, 
-             poses=poses, 
-             betas=betas, 
-             trans=trans, 
-             gender=gender)
-    print(f"Step 2 temporary result saved to: {temp_step2_path}")
-    
-    # Step 2.5: Smooth remaining large flips using adjacent frames
-    print("\n=== Step 2.5: Smoothing Remaining Large Flips ===")
-    
-    # Get information about which joints were fixed from the fix tracker
-    all_fixed_joints = fix_tracker.get_fixed_frames_and_joints()
-    
-    # Create mask for the smoothing function
-    # joint_optimization_mask: (8,) - which joints were optimized
-    joint_optimization_mask = np.any(all_fixed_joints, axis=0)  # (8,) - True if joint was fixed in any frame
-    poses = smooth_remaining_flips(poses, joint_optimization_mask, window_size=20)
-    
-    # Save temporary result after Step 2
-    temp_step2_5_path = os.path.join(render_path, f'{sequence_name}_step2.5_smoothed.npz')
-    np.savez(temp_step2_5_path, 
-             poses=poses, 
-             betas=betas, 
-             trans=trans, 
-             gender=gender)
+        # Step 2.5: Smooth remaining large flips using adjacent frames
+        # print("\n=== Step 2.5: Smoothing Remaining Large Flips ===")
+        
+        # Iteratively fix all joints together (exact logic from joint_pose_fix.py)
+
+        # Get information about which joints were fixed from the fix tracker
+        all_fixed_joints = fix_tracker.get_fixed_frames_and_joints()
+        
+        # Create mask for the smoothing function
+        # joint_optimization_mask: (8,) - which joints were optimized
+        joint_optimization_mask = np.any(all_fixed_joints, axis=0)  # (8,) - True if joint was fixed in any frame
+        poses = smooth_remaining_flips(poses, joint_optimization_mask, window_size=10)
+        
+        # Save temporary result after Step 2
+        # temp_step2_5_path = os.path.join(render_path, f'{sequence_name}_step2.5_smoothed.npz')
+        # np.savez(temp_step2_5_path, 
+        #         poses=poses, 
+        #         betas=betas, 
+        #         trans=trans, 
+        #         gender=gender)
+                
+        # print(f"Step 2.5 temporary result saved to: {temp_step2_5_path}")
+
+        # Step 3: Optimization with selective loss (uses SMPLX16 model)
+        
+        # print("\n=== Step 3: Optimization with Selective Loss (SMPLX16) ===")
+        all_fixed_joints = fix_tracker.get_fixed_frames_and_joints()
+        total_fixed_combinations = all_fixed_joints.sum()
+        original_poses = poses.copy()
+        if total_fixed_combinations > 0:
+            # print(f"Optimizing {total_fixed_combinations} joint-frame combinations using SMPLX16 model")
             
-    print(f"Step 2.5 temporary result saved to: {temp_step2_5_path}")
-
-    # Step 3: Optimization with selective loss (uses SMPLX16 model)
-    
-    print("\n=== Step 3: Optimization with Selective Loss (SMPLX16) ===")
-    all_fixed_joints = fix_tracker.get_fixed_frames_and_joints()
-    total_fixed_combinations = all_fixed_joints.sum()
-    original_poses = poses.copy()
-    if total_fixed_combinations < 0:
-        print(f"Optimizing {total_fixed_combinations} joint-frame combinations using SMPLX16 model")
+            # Store original poses for comparison
+            poses = optimize_poses_with_fixed_tracking(
+                poses, betas, trans, gender, object_verts, obj_normals, fix_tracker, 
+                distance_info, rhand_idx = rhand_idx, lhand_idx = lhand_idx,
+                num_epochs=600, lr = 0.001, canonical_joints=canonical_joints
+            )
+            # poses = smooth_remaining_flips(poses, joint_o÷ptimization_mask, window_size=20, threshold=10)
+            # Quick comparison of poses before and after optimization
+            # print("\n" + "="*60)
+            # print("QUICK POSE COMPARISON (Before vs After Optimization)")
+            # print("="*60)
+            # quick_pose_comparison(original_poses, poses)
+            
+            # Mark only the specific joint-frame combinations that were actually fixed as optimized
+            fix_tracker.mark_optimized_from_mask(all_fixed_joints)
+            # fixed_sequence_name.append(sequence_name)
+        else:
+            print("No joint-frame combinations to optimize")
         
-        # Store original poses for comparison
-        poses = optimize_poses_with_fixed_tracking(
-            poses, betas, trans, gender, object_verts, obj_normals, fix_tracker, 
-            distance_info, rhand_idx = rhand_idx, lhand_idx = lhand_idx,
-            num_epochs=500, lr = 0.001, canonical_joints=canonical_joints
-        )
-        # poses = smooth_remaining_flips(poses, joint_o÷ptimization_mask, window_size=20, threshold=10)
-        # Quick comparison of poses before and after optimization
-        print("\n" + "="*60)
-        print("QUICK POSE COMPARISON (Before vs After Optimization)")
-        print("="*60)
-        quick_pose_comparison(original_poses, poses)
+        # Save temporary result after Step 3
+        # temp_step3_path = os.path.join(render_path, f'{sequence_name}_step3_optimized.npz')
+        # np.savez(temp_step3_path, 
+        #         poses=poses, 
+        #         betas=betas, 
+        #         trans=trans, 
+        #         gender=gender)
+        # print(f"Step 3 temporary result saved to: {temp_step3_path}")
+
+        # Print summary
+        # fix_tracker.print_summary()
+        # optimize_finger(0, os.path.join(human_path,sequence_name), visualize=False, fname=sequence_name, render_path=render_path)
+
+        # Save final results
+        fixed_human_path = os.path.join(human_path, sequence_name, 'human_fixed.npz')
+        np.savez(fixed_human_path, 
+                poses=poses, 
+                betas=betas, 
+                trans=trans, 
+                gender=gender)
+        print(f"Final pipeline results saved to: {fixed_human_path}")
+
+        # Generate visualization
         
-        # Mark only the specific joint-frame combinations that were actually fixed as optimized
-        fix_tracker.mark_optimized_from_mask(all_fixed_joints)
-    else:
-        print("No joint-frame combinations to optimize")
-    
-    # Save temporary result after Step 3
-    temp_step3_path = os.path.join(render_path, f'{sequence_name}_step3_optimized.npz')
-    np.savez(temp_step3_path, 
-             poses=poses, 
-             betas=betas, 
-             trans=trans, 
-             gender=gender)
-    print(f"Step 3 temporary result saved to: {temp_step3_path}")
+        # Regenerate SMPL with fixed poses
+        if args.visualize:
+            if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
+                verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 10)
+            elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
+                verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 16)
+            elif dataset_path_name.upper() == 'CHAIRS':
+                verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10)
+            elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
+                verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
+            elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
+                verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 16)
 
-    # Print summary
-    fix_tracker.print_summary()
-    # optimize_finger(0, os.path.join(human_path,sequence_name), visualize=False, fname=sequence_name, render_path=render_path)
-
-    # Save final results
-    fixed_human_path = os.path.join(human_path, sequence_name, 'pipeline_fixed.npz')
-    np.savez(fixed_human_path, 
-             poses=poses, 
-             betas=betas, 
-             trans=trans, 
-             gender=gender)
-    print(f"Final pipeline results saved to: {fixed_human_path}")
-
-    # Generate visualization
-    
-    # Regenerate SMPL with fixed poses
-    if dataset_path_name.upper() == 'BEHAVE' or dataset_path_name.upper() == 'BEHAVE_CORRECT':
-        verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 10)
-    elif dataset_path_name.upper() == 'NEURALDOME' or dataset_path_name.upper() == 'IMHD':
-        verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplh', 16)
-    elif dataset_path_name.upper() == 'CHAIRS':
-        verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10)
-    elif dataset_path_name.upper() == 'INTERCAP' or dataset_path_name.upper() == 'INTERCAP_CORRECT':
-        verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 10, True)
-    elif dataset_path_name.upper() == 'OMOMO' or dataset_path_name.upper() == 'OMOMO_CORRECT':
-        verts, joints, faces = regen_smpl(sequence_name, poses, betas, trans, gender, 'smplx', 16)
-
-    visualize_body_obj(
-        verts.float().detach().cpu().numpy(),
-        faces[0].detach().cpu().numpy().astype(np.int32),
-        object_verts.detach().cpu().numpy(),
-        object_faces,
-        save_path=os.path.join(render_path, f'{sequence_name}_optimized.mp4'),
-        show_frame=True,
-        multi_angle=True,
-        # lhand_idx=lhand_idx,
-        # rhand_idx=rhand_idx
-    )
+            visualize_body_obj(
+                verts.float().detach().cpu().numpy(),
+                faces[0].detach().cpu().numpy().astype(np.int32),
+                object_verts.detach().cpu().numpy(),
+                object_faces,
+                save_path=os.path.join(render_path, f'{sequence_name}_optimized.mp4'),
+                show_frame=True,
+                multi_angle=True,
+            )
 
 def regen_smpl(name, poses, betas, trans, gender, model_type, num_betas, use_pca=False):
     """Regenerate SMPL with fixed poses"""
@@ -3356,7 +2714,7 @@ def smooth_remaining_flips(poses, joint_optimization_mask, window_size=10, thres
                 reference_after_flip = window_poses[flip_idx_in_window + 1]       # Frame right after the flip
 
                 for i in range(num_frames // 2):
-                    if i <= flip_idx_in_window:
+                    if i <= flip_idx_in_window and flip_idx_in_window != 0:
                         # Before the flip: use reference_after_flip as reference (poses after flip)
                         distance_from_flip = flip_idx_in_window - i
                         # Weight decreases as we move away from the flip (max 0.4 at flip boundary)
@@ -3382,12 +2740,16 @@ def smooth_remaining_flips(poses, joint_optimization_mask, window_size=10, thres
     
     return poses_smoothed
 
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Comprehensive pipeline: Joint fix + Palm fix + Optimization")
     parser.add_argument("--dataset_path", required=True, help="Path to the dataset root.")
     parser.add_argument("--sequence_name", required=True, help="Name of the sequence.")
+    parser.add_argument("--threshold", type=float, default=0.2, help="Angle threshold in radians for flip detection.")
+    parser.add_argument("--whole_dataset", type = bool, default=False, help="Whether to process the whole dataset.")
+    parser.add_argument("--visualize", type = bool, default=False, help="Whether to visualize the results.")
     args = parser.parse_args()
 
-    main(args.dataset_path, args.sequence_name)
+    main(args.dataset_path, args.sequence_name, args.threshold, args.whole_dataset)
